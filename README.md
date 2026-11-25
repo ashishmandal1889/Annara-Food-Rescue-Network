@@ -5,7 +5,7 @@
 [![MongoDB](https://img.shields.io/badge/MongoDB-Atlas%20%7C%208.2-green.svg)](https://www.mongodb.com/)
 [![React](https://img.shields.io/badge/React-19-blue.svg)](https://react.dev/)
 [![Vite](https://img.shields.io/badge/Vite-8-purple.svg)](https://vitejs.dev/)
-[![Tests](https://img.shields.io/badge/Tests-15%20Passed-success.svg)](#8-automated-testing-results)
+[![Tests](https://img.shields.io/badge/Tests-20%20Passed-success.svg)](#8-automated-testing-results)
 
 > **Annara** is an end-to-end full-stack platform that bridges the gap between surplus food sources (restaurants, catering businesses, corporate gatherings, weddings, and college festivals) and community organizations (NGOs, shelters, and individuals in need). Powered by **Spring Boot**, **MongoDB**, and **React**, registered delivery drivers coordinate transit, share verified live GPS coordinates, and document delivery handovers with photographic proof.
 

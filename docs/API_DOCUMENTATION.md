@@ -169,57 +169,127 @@ Base API URL: `http://localhost:8080/api`
 
 ---
 
-## 5. Delivery & GPS Tracking Endpoints
+## 5. Delivery Management, Proof & GPS Tracking Endpoints
 
 ### List Available Drivers
 - **Method**: `GET /api/drivers`
-- **Access**: Role `NGO`, `RECIPIENT`, or `ADMIN`
+- **Access**: Role `NGO`, `RECIPIENT`, `RESTAURANT`, or `ADMIN`
+- **Response**: `200 OK` (Includes `available: boolean` and `activeDeliveries: int` count to prevent conflicting assignments)
+
+### Admin Deliveries Metrics Summary
+- **Method**: `GET /api/deliveries/summary`
+- **Access**: Role `ADMIN`
+- **Response**: `200 OK`
+  ```json
+  {
+    "totalDeliveries": 42,
+    "pendingDeliveries": 4,
+    "assignedDeliveries": 6,
+    "acceptedDeliveries": 3,
+    "pickedUpDeliveries": 2,
+    "inTransitDeliveries": 5,
+    "deliveredDeliveries": 12,
+    "confirmedDeliveries": 10,
+    "failedDeliveries": 2,
+    "cancelledDeliveries": 1,
+    "totalMealsDelivered": 980,
+    "totalDrivers": 8,
+    "availableDrivers": 5
+  }
+  ```
+
+### List Deliveries (With Filters)
+- **Method**: `GET /api/deliveries` (or `GET /api/deliveries/mine`)
+- **Access**: Authenticated
+- **Query Parameters**:
+  - `status` (optional): Filter by `PENDING`, `ASSIGNED`, `ACCEPTED`, `PICKED_UP`, `IN_TRANSIT`, `DELIVERED`, `CONFIRMED`, `FAILED`, `CANCELLED`
 - **Response**: `200 OK`
 
-### List My Deliveries
-- **Method**: `GET /api/deliveries/mine`
-- **Access**: Authenticated (Driver, NGO, Recipient, Donor, Admin)
-- **Response**: `200 OK`
+### Get Delivery Details & Lifecycle
+- **Method**: `GET /api/deliveries/{id}`
+- **Access**: Authorized Delivery Participants or `ADMIN`
+- **Response**: `200 OK` (Includes full timeline, proof history from `delivery_proofs`, and latest GPS location)
 
-### Update Delivery Status
-- **Method**: `PATCH /api/deliveries/{id}/status`
-- **Access**: Assigned Driver or Admin
-- **Request Body**: `{"status": "PICKED_UP"}` / `IN_TRANSIT` / `DELIVERED` / `CANCELLED`
-- **Response**: `200 OK`
-
-### Upload Delivery Handover Proof
-- **Method**: `POST /api/deliveries/{id}/proof`
-- **Access**: Assigned Driver or NGO
-- **Content-Type**: `multipart/form-data`
-- **Part**: `image` (Handover confirmation photo)
-- **Response**: `200 OK`
-
-### Toggle GPS Tracking
-- **Method**: `PATCH /api/deliveries/{id}/tracking`
-- **Access**: Assigned Driver
-- **Request Body**: `{"enabled": true}` or `{"enabled": false}`
-- **Response**: `200 OK`
-
-### Broadcast Driver GPS Location
-- **Method**: `POST /api/tracking`
-- **Access**: Assigned Driver
+### Assign Driver
+- **Method**: `PUT /api/deliveries/{id}/assign` (or `POST /api/deliveries/{id}/assign`)
+- **Access**: `ADMIN`, Donor (`RESTAURANT`), or Recipient (`NGO` / `RECIPIENT`)
 - **Request Body**:
   ```json
   {
-    "deliveryId": "<delivery-id>",
-    "latitude": 12.9716,
-    "longitude": 77.5946,
+    "driverId": "<driver-id>",
+    "deliveryAddress": "City Shelter #4"
+  }
+  ```
+- **Validation**: Verifies driver is not busy with another active delivery in `ACCEPTED`, `PICKED_UP`, or `IN_TRANSIT` to prevent conflicting assignments.
+- **Response**: `200 OK` (Status updated to `ASSIGNED`)
+
+### Driver Accept Assignment
+- **Method**: `PUT /api/deliveries/{id}/accept`
+- **Access**: Assigned `DRIVER`
+- **Response**: `200 OK` (Status updated to `ACCEPTED`, sets `acceptedAt`)
+
+### Driver Decline Assignment
+- **Method**: `PUT /api/deliveries/{id}/reject`
+- **Access**: Assigned `DRIVER`
+- **Request Body** (optional): `{"reason": "Vehicle issue"}`
+- **Response**: `200 OK` (Status resets to `PENDING`, unassigns driver for re-queueing)
+
+### Update Delivery Status (Lifecycle Transitions)
+- **Method**: `PUT /api/deliveries/{id}/status` (or `PATCH /api/deliveries/{id}/status`)
+- **Access**: Authorized Participant or `ADMIN`
+- **Valid Transitions**:
+  - `PENDING` $\rightarrow$ `ASSIGNED`, `CANCELLED`
+  - `ASSIGNED` $\rightarrow$ `ACCEPTED`, `PENDING`, `PICKED_UP`, `CANCELLED`
+  - `ACCEPTED` $\rightarrow$ `PICKED_UP`, `CANCELLED`, `FAILED`
+  - `PICKED_UP` $\rightarrow$ `IN_TRANSIT`, `DELIVERED`, `FAILED`
+  - `IN_TRANSIT` $\rightarrow$ `DELIVERED`, `FAILED`
+  - `DELIVERED` $\rightarrow$ `CONFIRMED`, `FAILED`
+- **Request Body**: `{"status": "PICKED_UP"}` / `IN_TRANSIT` / `DELIVERED`
+- **Response**: `200 OK`
+
+### Broadcast Real-Time GPS Tracking Location
+- **Method**: `POST /api/deliveries/{id}/tracking` (or `POST /api/tracking`)
+- **Access**: Assigned `DRIVER` or `ADMIN`
+- **Request Body**:
+  ```json
+  {
+    "latitude": 12.971598,
+    "longitude": 77.594562,
     "speed": 28.5
   }
   ```
 - **Response**: `201 Created`
 
-### Get Latest Tracking Coordinate
-- **Method**: `GET /api/tracking/delivery/{deliveryId}/latest`
-- **Access**: Authorized Delivery Participants Only
+### Retrieve GPS Tracking History Trail
+- **Method**: `GET /api/deliveries/{id}/tracking` (or `GET /api/tracking/delivery/{id}`)
+- **Access**: Delivery Participants or `ADMIN`
+- **Response**: `200 OK` (Breadcrumb coordinate array for Leaflet polyline rendering)
+
+### Retrieve Latest Driver Coordinate
+- **Method**: `GET /api/deliveries/{id}/tracking/latest`
+- **Access**: Delivery Participants or `ADMIN`
 - **Response**: `200 OK`
 
-### Get Tracking History Trail
-- **Method**: `GET /api/tracking/delivery/{deliveryId}`
-- **Access**: Authorized Delivery Participants Only
-- **Response**: `200 OK` (Breadcrumb route coordinates)
+### Upload Delivery Handover Proof
+- **Method**: `POST /api/deliveries/{id}/proof`
+- **Access**: Assigned `DRIVER`, `NGO`, or `ADMIN`
+- **Content-Type**: `multipart/form-data`
+- **Parts**:
+  - `image`: Handover photo (JPEG, PNG, WebP $\le 5$ MB)
+  - `receiverName` (optional): Name of person receiving the food
+  - `latitude` (optional): Geotagged drop-off latitude
+  - `longitude` (optional): Geotagged drop-off longitude
+- **Database Persistence**: Saved in MongoDB `delivery_proofs` collection with timestamp and link to `deliveries`
+- **Response**: `200 OK` (Transitions status to `DELIVERED`)
+
+### Recipient Confirm Food Receipt
+- **Method**: `PUT /api/deliveries/{id}/confirm`
+- **Access**: Recipient (`NGO` / `RECIPIENT`) or `ADMIN`
+- **Request Body** (optional): `{"notes": "Meals received in hygienic condition"}`
+- **Response**: `200 OK` (Transitions status to `CONFIRMED`, sets `recipientConfirmed = true`, marks claim `COMPLETED`)
+
+### Report Delivery Issue / Failure
+- **Method**: `PUT /api/deliveries/{id}/fail`
+- **Access**: Delivery Participants or `ADMIN`
+- **Request Body**: `{"reason": "Food damaged in transit / recipient unavailable"}`
+- **Response**: `200 OK` (Transitions status to `FAILED`, sets `failureReason`)

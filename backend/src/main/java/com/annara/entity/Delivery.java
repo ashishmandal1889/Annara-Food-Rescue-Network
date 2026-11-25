@@ -29,15 +29,28 @@ public class Delivery {
     public FoodRequest foodRequest;
 
     public Integer mealCount;
+    public String pickupAddress;
     public String deliveryAddress;
     public String proofImageFile;
 
     @Indexed
-    public DeliveryStatus status = DeliveryStatus.ASSIGNED;
+    public DeliveryStatus status = DeliveryStatus.PENDING;
 
     @Indexed
     public LocalDateTime createdAt = LocalDateTime.now();
 
+    public LocalDateTime acceptedAt;
+    public LocalDateTime pickedUpAt;
     public LocalDateTime deliveredAt;
+    public LocalDateTime confirmedAt;
+    public LocalDateTime failedAt;
+    public String failureReason;
+
+    public String receiverName;
+    public Double deliveryLatitude;
+    public Double deliveryLongitude;
+    public Boolean recipientConfirmed = false;
+    public String recipientNotes;
+
     public Boolean trackingEnabled = true;
 }

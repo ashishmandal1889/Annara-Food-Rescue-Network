@@ -5,9 +5,16 @@ import {
   Truck, LogOut, UserRound, ArrowUpRight, ShieldCheck, Menu, X,
   CircleCheck, PackageCheck, HandHeart, Filter, ChevronRight, Camera,
   ClipboardList, Navigation, Edit3, Trash2, AlertCircle, ExternalLink,
-  ToggleLeft, ToggleRight, Eye, RefreshCw
+  ToggleLeft, ToggleRight, Eye, RefreshCw, UserCheck
 } from 'lucide-react';
+import 'leaflet/dist/leaflet.css';
 import './style.css';
+
+import DeliveryTracking from './DeliveryTracking';
+import DeliveryDetails from './DeliveryDetails';
+import DriverDashboard from './DriverDashboard';
+import DeliveryDashboard from './DeliveryDashboard';
+import DeliveryHistory from './DeliveryHistory';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:8080/api';
 
@@ -65,6 +72,9 @@ function App() {
   const [trackingData, setTrackingData] = useState(null);
   const [proofTarget, setProofTarget] = useState(null); // delivery
   const [proofFile, setProofFile] = useState(null);
+  const [proofReceiverName, setProofReceiverName] = useState('');
+  const [detailsDelivery, setDetailsDelivery] = useState(null);
+  const [trackingDelivery, setTrackingDelivery] = useState(null);
   const [confirmModal, setConfirmModal] = useState(null); // { title, message, onConfirm }
 
   // Forms
@@ -438,18 +448,28 @@ function App() {
 
   async function submitDriverAssignment(e) {
     e.preventDefault();
-    if (!driverAssignTarget || !selectedDriverId || !deliveryDropoffAddress.trim()) return;
+    if (!driverAssignTarget || !selectedDriverId) return;
     setLoading(true);
     try {
       const { type, item } = driverAssignTarget;
-      const path = type === 'claim' ? `/claims/${item.id}/delivery` : `/requests/${item.id}/delivery`;
-      await api(path, {
-        method: 'POST',
-        body: JSON.stringify({
-          driverId: String(selectedDriverId),
-          deliveryAddress: deliveryDropoffAddress.trim()
-        })
-      });
+      if (type === 'delivery') {
+        await api(`/deliveries/${item.id}/assign`, {
+          method: 'PUT',
+          body: JSON.stringify({
+            driverId: String(selectedDriverId),
+            deliveryAddress: deliveryDropoffAddress.trim() || item.deliveryAddress
+          })
+        });
+      } else {
+        const path = type === 'claim' ? `/claims/${item.id}/delivery` : `/requests/${item.id}/delivery`;
+        await api(path, {
+          method: 'POST',
+          body: JSON.stringify({
+            driverId: String(selectedDriverId),
+            deliveryAddress: deliveryDropoffAddress.trim()
+          })
+        });
+      }
       flash('Delivery successfully assigned to driver.');
       setDriverAssignTarget(null);
       await refresh();
@@ -461,13 +481,67 @@ function App() {
     }
   }
 
-  // --- DRIVER WORKFLOW & GPS ---
-  async function advanceDeliveryStatus(delivery) {
-    const next = delivery.status === 'ASSIGNED' ? 'PICKED_UP' : delivery.status === 'PICKED_UP' ? 'IN_TRANSIT' : 'DELIVERED';
+  // --- DRIVER WORKFLOW & DELIVERY LIFECYCLE ---
+  async function acceptAssignment(delivery) {
     setBusyId(delivery.id);
     try {
-      await api(`/deliveries/${delivery.id}/status`, { method: 'PATCH', body: JSON.stringify({ status: next }) });
+      await api(`/deliveries/${delivery.id}/accept`, { method: 'PUT' });
+      flash('Delivery assignment accepted.');
+      await refresh();
+    } catch (e) {
+      flash(e.message, 'error');
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function rejectAssignment(delivery) {
+    setBusyId(delivery.id);
+    try {
+      await api(`/deliveries/${delivery.id}/reject`, { method: 'PUT' });
+      flash('Assignment declined. Delivery returned to pending queue.');
+      await refresh();
+    } catch (e) {
+      flash(e.message, 'error');
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function advanceDeliveryStatus(delivery, nextStatus) {
+    const next = nextStatus || (delivery.status === 'ASSIGNED' ? 'ACCEPTED' : delivery.status === 'ACCEPTED' ? 'PICKED_UP' : delivery.status === 'PICKED_UP' ? 'IN_TRANSIT' : 'DELIVERED');
+    setBusyId(delivery.id);
+    try {
+      await api(`/deliveries/${delivery.id}/status`, { method: 'PUT', body: JSON.stringify({ status: next }) });
       flash(`Delivery status updated to ${next}.`);
+      await refresh();
+    } catch (e) {
+      flash(e.message, 'error');
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function confirmReceipt(delivery, notes) {
+    setBusyId(delivery.id);
+    try {
+      await api(`/deliveries/${delivery.id}/confirm`, { method: 'PUT', body: JSON.stringify({ notes }) });
+      flash('Food receipt successfully confirmed!');
+      if (detailsDelivery && detailsDelivery.id === delivery.id) setDetailsDelivery(null);
+      await refresh();
+    } catch (e) {
+      flash(e.message, 'error');
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function reportIssue(delivery, reason) {
+    setBusyId(delivery.id);
+    try {
+      await api(`/deliveries/${delivery.id}/fail`, { method: 'PUT', body: JSON.stringify({ reason }) });
+      flash('Delivery issue recorded.');
+      if (detailsDelivery && detailsDelivery.id === delivery.id) setDetailsDelivery(null);
       await refresh();
     } catch (e) {
       flash(e.message, 'error');
@@ -516,14 +590,7 @@ function App() {
   }
 
   async function viewTrackingModal(delivery) {
-    setTrackingTarget(delivery);
-    setTrackingData(null);
-    try {
-      const latest = await api(`/tracking/delivery/${delivery.id}/latest`);
-      setTrackingData(latest);
-    } catch {
-      setTrackingData({ empty: true });
-    }
+    setTrackingDelivery(delivery);
   }
 
   async function submitProof(e) {
@@ -533,10 +600,21 @@ function App() {
     try {
       const fd = new FormData();
       fd.append('image', proofFile);
+      if (proofReceiverName.trim()) {
+        fd.append('receiverName', proofReceiverName.trim());
+      }
+      if (navigator.geolocation) {
+        try {
+          const pos = await new Promise((res, rej) => navigator.geolocation.getCurrentPosition(res, rej, { timeout: 3000 }));
+          fd.append('latitude', pos.coords.latitude);
+          fd.append('longitude', pos.coords.longitude);
+        } catch {}
+      }
       await api(`/deliveries/${proofTarget.id}/proof`, { method: 'POST', body: fd });
-      flash('Proof of delivery photo uploaded.');
+      flash('Proof of delivery photo and handover details uploaded.');
       setProofTarget(null);
       setProofFile(null);
+      setProofReceiverName('');
       await refresh();
     } catch (err) {
       flash(err.message, 'error');
@@ -551,7 +629,8 @@ function App() {
     { id: 'my-donations', label: 'My donations', icon: PackageCheck, roles: ['RESTAURANT', 'ADMIN'] },
     { id: 'claims', label: 'My claims', icon: HandHeart, roles: ['NGO', 'RECIPIENT', 'ADMIN'] },
     { id: 'requests', label: 'Food requests', icon: ClipboardList, roles: ['NGO', 'RECIPIENT', 'RESTAURANT', 'ADMIN'] },
-    { id: 'deliveries', label: 'Deliveries', icon: Truck, roles: ['NGO', 'RECIPIENT', 'DRIVER', 'RESTAURANT', 'ADMIN'] }
+    { id: 'deliveries', label: user?.role === 'DRIVER' ? 'Driver Hub' : 'Deliveries', icon: Truck, roles: ['NGO', 'RECIPIENT', 'DRIVER', 'RESTAURANT', 'ADMIN'] },
+    { id: 'history', label: 'Delivery history', icon: ClipboardList, roles: ['NGO', 'RECIPIENT', 'DRIVER', 'RESTAURANT', 'ADMIN'] }
   ];
 
   const activeNav = nav.filter(n => !n.roles || n.roles.includes(user?.role));
@@ -560,7 +639,8 @@ function App() {
     'my-donations': 'Your donations',
     claims: 'Your food claims',
     requests: 'Community food requests',
-    deliveries: 'Delivery workspace'
+    deliveries: user?.role === 'DRIVER' ? 'Driver Operations Hub' : 'Delivery workspace',
+    history: 'Delivery audit & history'
   })[page] || 'Discover surplus food';
 
   return (
@@ -935,73 +1015,48 @@ function App() {
 
           {/* PAGE: DELIVERIES */}
           {page === 'deliveries' && (
-            <div className="table-card">
-              <div className="table-head">
-                <strong>Delivery coordination & live tracking</strong>
-                <span>{deliveries.length} deliver{deliveries.length === 1 ? 'y' : 'ies'}</span>
-              </div>
-              {deliveries.length ? (
-                deliveries.map(d => (
-                  <div className="activity-row" key={d.id}>
-                    <div className="activity-icon"><Truck /></div>
-                    <div className="activity-main">
-                      <strong>{d.foodName} · {d.mealCount} meals</strong>
-                      <span>Pickup: {d.pickupAddress || 'Provided upon confirmation'} · Drop-off: {d.deliveryAddress}</span>
-                      <span>
-                        Driver: {d.driverName} ({d.driverPhone || 'No phone'}) · Recipient: {d.recipientName} ({d.recipientPhone || 'No phone'})
-                      </span>
-                      {d.deliveredAt && <small style={{ color: '#2e7d32' }}>Delivered at {fmt(d.deliveredAt)}</small>}
-                    </div>
+            user?.role === 'DRIVER' ? (
+              <DriverDashboard
+                deliveries={deliveries}
+                onRefresh={refresh}
+                onAccept={acceptAssignment}
+                onReject={rejectAssignment}
+                onAdvance={advanceDeliveryStatus}
+                onTrack={d => setTrackingDelivery(d)}
+                onProof={d => setProofTarget(d)}
+                onDetails={d => setDetailsDelivery(d)}
+                busyId={busyId}
+                fmt={fmt}
+              />
+            ) : (
+              <DeliveryDashboard
+                deliveries={deliveries}
+                user={user}
+                onAssignDriver={d => {
+                  setDriverAssignTarget({ type: 'delivery', item: d });
+                  setSelectedDriverId(drivers[0]?.id || '');
+                  setDeliveryDropoffAddress(d.deliveryAddress || '');
+                }}
+                onConfirmReceipt={confirmReceipt}
+                onReportIssue={reportIssue}
+                onTrack={d => setTrackingDelivery(d)}
+                onProof={d => setProofTarget(d)}
+                onDetails={d => setDetailsDelivery(d)}
+                api={api}
+                busyId={busyId}
+                fmt={fmt}
+              />
+            )
+          )}
 
-                    <span className={`badge-${d.status.toLowerCase()}`}>{d.status}</span>
-
-                    <div className="card-actions">
-                      {/* Driver Status Transition Controls */}
-                      {user?.role === 'DRIVER' && d.status !== 'DELIVERED' && d.status !== 'CANCELLED' && (
-                        <>
-                          <button
-                            className="btn btn-dark btn-sm"
-                            disabled={busyId === d.id}
-                            onClick={() => advanceDeliveryStatus(d)}
-                          >
-                            {d.status === 'ASSIGNED' ? 'Mark Picked Up' : d.status === 'PICKED_UP' ? 'Start Transit' : 'Mark Delivered'}
-                          </button>
-                          <button className="btn btn-outline btn-sm" onClick={() => shareLocation(d)} title="Broadcast current GPS to participants">
-                            <Navigation size={13} /> Share GPS
-                          </button>
-                          <button
-                            className="btn btn-outline btn-sm"
-                            onClick={() => toggleTracking(d)}
-                            title={d.trackingEnabled ? 'Disable location sharing' : 'Enable location sharing'}
-                          >
-                            {d.trackingEnabled ? <ToggleRight size={15} color="#2e7d32" /> : <ToggleLeft size={15} />}
-                          </button>
-                        </>
-                      )}
-
-                      {/* Proof Photo Upload & View */}
-                      {['DRIVER', 'NGO', 'ADMIN'].includes(user?.role) && d.status !== 'CANCELLED' && (
-                        <button className="btn btn-outline btn-sm" onClick={() => setProofTarget(d)}>
-                          <Camera size={13} /> {d.proofImageUrl ? 'View Proof' : 'Upload Proof'}
-                        </button>
-                      )}
-
-                      {/* Participant View Location */}
-                      {d.status !== 'CANCELLED' && (
-                        <button className="btn btn-outline btn-sm" onClick={() => viewTrackingModal(d)}>
-                          <Eye size={13} /> Track
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                ))
-              ) : (
-                <Empty
-                  title="No active deliveries"
-                  text="Once an approved claim or matched request has a registered driver assigned, delivery tracking appears here."
-                />
-              )}
-            </div>
+          {/* PAGE: DELIVERY HISTORY */}
+          {page === 'history' && (
+            <DeliveryHistory
+              deliveries={deliveries}
+              onDetails={d => setDetailsDelivery(d)}
+              onProof={d => setProofTarget(d)}
+              fmt={fmt}
+            />
           )}
 
           {/* FOOTER */}
@@ -1470,6 +1525,13 @@ function App() {
 
             {user?.role === 'DRIVER' && (
               <form onSubmit={submitProof} className="form-stack">
+                <Field label="Receiver / Contact Name">
+                  <input
+                    value={proofReceiverName}
+                    onChange={e => setProofReceiverName(e.target.value)}
+                    placeholder="e.g. Sister Mary / Ramesh (Shelter Staff)"
+                  />
+                </Field>
                 <label className="upload-box">
                   <input type="file" accept="image/*" onChange={e => setProofFile(e.target.files?.[0] || null)} />
                   {proofFile ? (
@@ -1495,6 +1557,31 @@ function App() {
             )}
           </div>
         </Modal>
+      )}
+
+      {/* MODAL: LIVE GPS TRACKING (LEAFLET MAP) */}
+      {trackingDelivery && (
+        <DeliveryTracking
+          delivery={trackingDelivery}
+          onClose={() => setTrackingDelivery(null)}
+          api={api}
+          flash={flash}
+          user={user}
+        />
+      )}
+
+      {/* MODAL: DELIVERY DETAILS & LIFECYCLE */}
+      {detailsDelivery && (
+        <DeliveryDetails
+          delivery={detailsDelivery}
+          onClose={() => setDetailsDelivery(null)}
+          onTrack={d => { setDetailsDelivery(null); setTrackingDelivery(d); }}
+          onProof={d => { setDetailsDelivery(null); setProofTarget(d); }}
+          onConfirm={confirmReceipt}
+          onFail={reportIssue}
+          user={user}
+          fmt={fmt}
+        />
       )}
 
       {/* CONFIRMATION MODAL */}

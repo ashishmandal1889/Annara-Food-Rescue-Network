@@ -49,6 +49,7 @@ public class ApiController {
     private final ClaimRepository claims;
     private final FoodRequestRepository requests;
     private final DeliveryRepository deliveries;
+    private final DeliveryProofRepository deliveryProofs;
     private final TrackingLocationRepository trackingLocations;
     private final MongoTemplate mongoTemplate;
     private final PasswordEncoder encoder;
@@ -61,6 +62,7 @@ public class ApiController {
             ClaimRepository claims,
             FoodRequestRepository requests,
             DeliveryRepository deliveries,
+            DeliveryProofRepository deliveryProofs,
             TrackingLocationRepository trackingLocations,
             MongoTemplate mongoTemplate,
             PasswordEncoder encoder,
@@ -73,6 +75,7 @@ public class ApiController {
         this.claims = claims;
         this.requests = requests;
         this.deliveries = deliveries;
+        this.deliveryProofs = deliveryProofs;
         this.trackingLocations = trackingLocations;
         this.mongoTemplate = mongoTemplate;
         this.encoder = encoder;
@@ -133,7 +136,7 @@ public class ApiController {
 
     public record DeliveryInput(
             @NotBlank String donationId,
-            @NotBlank String driverId,
+            String driverId,
             @NotNull @Min(1) Integer mealCount,
             @NotBlank String deliveryAddress
     ) {}
@@ -143,10 +146,28 @@ public class ApiController {
     public record ClaimDeliveryInput(@NotBlank String driverId, @NotBlank String deliveryAddress) {}
     public record RequestMatchInput(@NotBlank String donationId) {}
 
+    public record DeliveryAssignInput(@NotBlank String driverId, String deliveryAddress) {}
+    public record DeliveryRejectInput(String reason) {}
+    public record DeliveryStatusUpdateInput(
+            @NotBlank String status,
+            String failureReason,
+            String receiverName,
+            Double latitude,
+            Double longitude
+    ) {}
+    public record DeliveryConfirmInput(String notes) {}
+    public record DeliveryFailInput(@NotBlank String reason) {}
+
     public record TrackingToggle(@NotNull Boolean enabled) {}
 
     public record TrackingInput(
             @NotBlank String deliveryId,
+            @NotNull @DecimalMin("-90.0") @DecimalMax("90.0") Double latitude,
+            @NotNull @DecimalMin("-180.0") @DecimalMax("180.0") Double longitude,
+            @DecimalMin("0.0") Double speed
+    ) {}
+
+    public record DeliveryLocationInput(
             @NotNull @DecimalMin("-90.0") @DecimalMax("90.0") Double latitude,
             @NotNull @DecimalMin("-180.0") @DecimalMax("180.0") Double longitude,
             @DecimalMin("0.0") Double speed
@@ -199,20 +220,21 @@ public class ApiController {
         }
 
         AppUser user = new AppUser();
-
         user.fullName = in.fullName().trim();
-        user.organisationName = in.organisationName();
+        user.organisationName = in.organisationName() == null ? null : in.organisationName().trim();
         user.email = email;
         user.passwordHash = encoder.encode(in.password());
-        user.phone = in.phone();
-        user.city = in.city();
+        user.phone = in.phone() == null ? null : in.phone().trim();
+        user.city = in.city() == null ? null : in.city().trim();
         user.role = role;
 
         users.save(user);
 
+        String token = jwt.issue(user);
+
         return ResponseEntity
                 .status(HttpStatus.CREATED)
-                .body(authResponse(user));
+                .body(new AuthResponse(token, userMap(user)));
     }
 
     // -------------------- LOGIN --------------------
@@ -221,14 +243,15 @@ public class ApiController {
     public AuthResponse login(
             @Valid @RequestBody Login in
     ) {
-        AppUser user = users.findByEmailIgnoreCase(
-                in.email().trim()
-        ).orElseThrow(() ->
-                new ResponseStatusException(
-                        HttpStatus.UNAUTHORIZED,
-                        "Invalid email or password"
-                )
-        );
+        String email = in.email().trim().toLowerCase(Locale.ROOT);
+
+        AppUser user = users.findByEmailIgnoreCase(email)
+                .orElseThrow(() ->
+                        new ResponseStatusException(
+                                HttpStatus.UNAUTHORIZED,
+                                "Invalid email or password"
+                        )
+                );
 
         if (!encoder.matches(in.password(), user.passwordHash)) {
             throw new ResponseStatusException(
@@ -237,104 +260,19 @@ public class ApiController {
             );
         }
 
-        return authResponse(user);
-    }
+        String token = jwt.issue(user);
 
-    private AuthResponse authResponse(AppUser user) {
-        Map<String, Object> details = new LinkedHashMap<>();
-
-        details.put("id", user.id);
-        details.put("fullName", user.fullName);
-        details.put(
-                "organisationName",
-                Objects.toString(user.organisationName, "")
-        );
-        details.put("email", user.email);
-        details.put("role", user.role.name());
-        details.put("city", Objects.toString(user.city, ""));
-        details.put("phone", Objects.toString(user.phone, ""));
-        details.put("createdAt", user.createdAt);
-
-        return new AuthResponse(
-                jwt.issue(user),
-                details
-        );
+        return new AuthResponse(token, userMap(user));
     }
 
     // -------------------- CURRENT USER --------------------
 
     @GetMapping("/me")
-    public Map<String, Object> me(
-            Authentication authentication
-    ) {
-        return authResponse(current(authentication)).user();
+    public Map<String, Object> me(Authentication authentication) {
+        return userMap(current(authentication));
     }
 
-    // -------------------- LIST AVAILABLE DONATIONS --------------------
-
-    @GetMapping("/donations")
-    public List<Map<String, Object>> listDonations(
-            @RequestParam(required = false) String q,
-            @RequestParam(required = false) String city
-    ) {
-        return donations.findAllByOrderByCreatedAtDesc()
-                .stream()
-                .filter(d ->
-                        d.status == DonationStatus.AVAILABLE
-                                || d.status == DonationStatus.PARTIALLY_CLAIMED
-                )
-                .filter(d ->
-                        d.pickupBefore != null
-                                && d.pickupBefore.isAfter(LocalDateTime.now())
-                                && d.remainingMeals != null
-                                && d.remainingMeals > 0
-                )
-                .filter(d ->
-                        q == null
-                                || (
-                                d.foodName + " "
-                                        + Objects.toString(d.description, "") + " "
-                                        + Objects.toString(d.foodType, "")
-                        ).toLowerCase(Locale.ROOT)
-                                .contains(q.toLowerCase(Locale.ROOT))
-                )
-                .filter(d ->
-                        city == null
-                                || (d.donor != null && Objects.toString(d.donor.city, "")
-                                .equalsIgnoreCase(city))
-                )
-                .map(this::donationMap)
-                .toList();
-    }
-
-    // -------------------- GET SINGLE DONATION --------------------
-
-    @GetMapping("/donations/{id}")
-    public Map<String, Object> getDonation(
-            @PathVariable String id
-    ) {
-        Donation donation = donations.findById(id).orElseThrow(() ->
-                new ResponseStatusException(HttpStatus.NOT_FOUND, "Donation not found"));
-        return donationMap(donation);
-    }
-
-    // -------------------- DONOR'S OWN DONATIONS --------------------
-
-    @GetMapping("/donations/mine")
-    public List<Map<String, Object>> myDonations(
-            Authentication authentication
-    ) {
-        AppUser user = current(authentication);
-        requireRole(user, Role.RESTAURANT);
-
-        return donations
-                .findByDonorIdOrderByCreatedAtDesc(user.id)
-                .stream()
-                .map(this::donationMap)
-                .toList();
-    }
-
-    // -------------------- CREATE FOOD DONATION --------------------
+    // -------------------- CREATE DONATION --------------------
 
     @PostMapping(
             value = "/donations",
@@ -343,32 +281,31 @@ public class ApiController {
     public ResponseEntity<?> createDonation(
             Authentication authentication,
             @RequestPart("data") @Valid DonationInput in,
-            @RequestPart(value = "image", required = false)
-            MultipartFile image
+            @RequestPart(value = "image", required = false) MultipartFile image
     ) throws IOException {
 
-        AppUser user = current(authentication);
-        requireRole(user, Role.RESTAURANT);
+        AppUser donor = current(authentication);
+        requireRole(donor, Role.RESTAURANT);
 
-        if (!in.pickupBefore().isAfter(LocalDateTime.now())) {
+        if (in.pickupBefore().isBefore(LocalDateTime.now())) {
             throw new ResponseStatusException(
                     HttpStatus.BAD_REQUEST,
-                    "Pickup deadline must be in the future"
+                    "Pickup-before time must be in the future"
             );
         }
 
         Donation donation = new Donation();
 
+        donation.donor = donor;
         donation.foodName = in.foodName().trim();
         donation.description = in.description();
-        donation.foodType = in.foodType();
-        donation.sourceType = in.sourceType() == null || in.sourceType().isBlank() ? "RESTAURANT" : in.sourceType().trim().toUpperCase(Locale.ROOT);
-        donation.sourceName = in.sourceName();
+        donation.foodType = in.foodType().trim();
+        donation.sourceType = in.sourceType() == null ? "RESTAURANT" : in.sourceType().trim();
+        donation.sourceName = in.sourceName() == null ? null : in.sourceName().trim();
         donation.totalMeals = in.totalMeals();
         donation.remainingMeals = in.totalMeals();
         donation.pickupAddress = in.pickupAddress().trim();
         donation.pickupBefore = in.pickupBefore();
-        donation.donor = user;
         donation.status = DonationStatus.AVAILABLE;
 
         if (image != null && !image.isEmpty()) {
@@ -382,44 +319,94 @@ public class ApiController {
                 .body(donationMap(donation));
     }
 
-    // -------------------- UPDATE OWN DONATION --------------------
+    // -------------------- PUBLIC & MARKETPLACE DONATIONS --------------------
 
-    @PutMapping(value = "/donations/{id}", consumes = MediaType.APPLICATION_JSON_VALUE)
+    @GetMapping("/donations")
+    public List<Map<String, Object>> listDonations(
+            @RequestParam(required = false) String foodType,
+            @RequestParam(required = false) String city
+    ) {
+        return donations.findAllByOrderByCreatedAtDesc()
+                .stream()
+                .filter(d -> d.status == DonationStatus.AVAILABLE || d.status == DonationStatus.PARTIALLY_CLAIMED)
+                .filter(d -> d.pickupBefore != null && d.pickupBefore.isAfter(LocalDateTime.now()))
+                .filter(d -> d.remainingMeals != null && d.remainingMeals > 0)
+                .filter(d -> foodType == null || foodType.isBlank() || foodType.equalsIgnoreCase("ALL")
+                        || (d.foodType != null && d.foodType.equalsIgnoreCase(foodType.trim())))
+                .filter(d -> city == null || city.isBlank() || city.equalsIgnoreCase("ALL")
+                        || (d.donor != null && d.donor.city != null && d.donor.city.equalsIgnoreCase(city.trim())))
+                .map(this::donationMap)
+                .toList();
+    }
+
+    @GetMapping("/donations/{id}")
+    public Map<String, Object> getDonation(
+            @PathVariable String id
+    ) {
+        Donation donation = donations.findById(id)
+                .orElseThrow(() ->
+                        new ResponseStatusException(
+                                HttpStatus.NOT_FOUND,
+                                "Donation not found"
+                        )
+                );
+
+        return donationMap(donation);
+    }
+
+    // -------------------- DONOR'S OWN DONATIONS --------------------
+
+    @GetMapping("/donations/mine")
+    public List<Map<String, Object>> myDonations(
+            Authentication authentication
+    ) {
+        AppUser donor = current(authentication);
+        requireRole(donor, Role.RESTAURANT);
+
+        return donations
+                .findByDonorIdOrderByCreatedAtDesc(donor.id)
+                .stream()
+                .map(this::donationMap)
+                .toList();
+    }
+
+    // -------------------- UPDATE DONATION --------------------
+
+    @PutMapping("/donations/{id}")
     public Map<String, Object> updateDonation(
             @PathVariable String id,
             Authentication authentication,
             @Valid @RequestBody DonationInput in
     ) {
         AppUser donor = current(authentication);
-        requireRole(donor, Role.RESTAURANT);
         Donation donation = donations.findById(id).orElseThrow(() ->
                 new ResponseStatusException(HttpStatus.NOT_FOUND, "Donation not found"));
         if (donation.donor == null || !donation.donor.id.equals(donor.id)) {
             throw new ResponseStatusException(HttpStatus.FORBIDDEN, "You can only edit your own donations");
         }
         if (donation.status == DonationStatus.CANCELLED || donation.status == DonationStatus.EXPIRED) {
-            throw new ResponseStatusException(HttpStatus.CONFLICT, "This donation can no longer be edited");
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Cannot edit a cancelled or expired donation");
         }
-        if (!in.pickupBefore().isAfter(LocalDateTime.now())) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Pickup deadline must be in the future");
-        }
-        int alreadyClaimed = donation.totalMeals - donation.remainingMeals;
-        if (in.totalMeals() < alreadyClaimed) {
-            throw new ResponseStatusException(HttpStatus.CONFLICT, "Total meals cannot be less than meals already claimed");
+        int claimed = donation.totalMeals - donation.remainingMeals;
+        if (in.totalMeals() < claimed) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT,
+                    "Total meals cannot be less than already claimed portions (" + claimed + ")");
         }
         donation.foodName = in.foodName().trim();
         donation.description = in.description();
-        donation.foodType = in.foodType();
-        donation.sourceType = in.sourceType() == null || in.sourceType().isBlank() ? "RESTAURANT" : in.sourceType().trim().toUpperCase(Locale.ROOT);
-        donation.sourceName = in.sourceName();
+        donation.foodType = in.foodType().trim();
+        if (in.sourceType() != null) donation.sourceType = in.sourceType().trim();
+        if (in.sourceName() != null) donation.sourceName = in.sourceName().trim();
         donation.totalMeals = in.totalMeals();
-        donation.remainingMeals = in.totalMeals() - alreadyClaimed;
+        donation.remainingMeals = in.totalMeals() - claimed;
         donation.pickupAddress = in.pickupAddress().trim();
         donation.pickupBefore = in.pickupBefore();
-        if (donation.remainingMeals > 0) {
-            donation.status = alreadyClaimed == 0 ? DonationStatus.AVAILABLE : DonationStatus.PARTIALLY_CLAIMED;
-        } else {
+        if (donation.remainingMeals == 0) {
             donation.status = DonationStatus.FULLY_CLAIMED;
+        } else if (claimed > 0) {
+            donation.status = DonationStatus.PARTIALLY_CLAIMED;
+        } else {
+            donation.status = DonationStatus.AVAILABLE;
         }
         donations.save(donation);
         return donationMap(donation);
@@ -427,26 +414,22 @@ public class ApiController {
 
     // -------------------- CANCEL DONATION --------------------
 
-    @PatchMapping("/donations/{id}/cancel")
+    @RequestMapping(value = {"/donations/{id}", "/donations/{id}/cancel"}, method = {RequestMethod.DELETE, RequestMethod.PATCH})
     public Map<String, Object> cancelDonation(
             @PathVariable String id,
             Authentication authentication
     ) {
         AppUser donor = current(authentication);
-        requireRole(donor, Role.RESTAURANT);
         Donation donation = donations.findById(id).orElseThrow(() ->
                 new ResponseStatusException(HttpStatus.NOT_FOUND, "Donation not found"));
         if (donation.donor == null || !donation.donor.id.equals(donor.id)) {
             throw new ResponseStatusException(HttpStatus.FORBIDDEN, "You can only cancel your own donations");
         }
-        if (claims.findByDonationDonorIdOrderByCreatedAtDesc(donor.id).stream()
-                .anyMatch(c -> c.donation != null && c.donation.id.equals(id)
-                        && (c.status == ClaimStatus.APPROVED || c.status == ClaimStatus.CONFIRMED))) {
-            throw new ResponseStatusException(HttpStatus.CONFLICT, "This donation has an approved claim; coordinate with the claimant before cancelling");
+        if (donation.status == DonationStatus.CANCELLED) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Donation is already cancelled");
         }
-
-        // Cancel all pending claims on this donation
-        List<FoodClaim> pendingClaims = claims.findByDonationId(id).stream()
+        List<FoodClaim> pendingClaims = claims.findByDonationDonorIdOrderByCreatedAtDesc(donor.id).stream()
+                .filter(c -> c.donation != null && c.donation.id.equals(id))
                 .filter(c -> c.status == ClaimStatus.PENDING)
                 .toList();
         for (FoodClaim pc : pendingClaims) {
@@ -556,7 +539,7 @@ public class ApiController {
                 .body(claimMap(claim));
     }
 
-    // -------------------- DONOR CLAIM REVIEW --------------------
+    // -------------------- DONOR CLAIM REVIEW & AUTOMATIC DELIVERY CREATION --------------------
 
     @GetMapping("/donations/{id}/claims")
     public List<Map<String, Object>> claimsForDonation(
@@ -611,6 +594,28 @@ public class ApiController {
         }
         if (requested.equals("APPROVED")) {
             claim.status = ClaimStatus.APPROVED;
+
+            // 1. AUTOMATIC DELIVERY CREATION AFTER CLAIM APPROVAL
+            if (!deliveries.existsByClaimId(claim.id)) {
+                Delivery delivery = new Delivery();
+                delivery.claim = claim;
+                delivery.donation = claim.donation;
+                delivery.ngo = (claim.claimant != null && claim.claimant.role == Role.NGO) ? claim.claimant : null;
+                delivery.mealCount = claim.requestedMeals;
+                delivery.pickupAddress = claim.donation != null ? claim.donation.pickupAddress : "";
+                String defaultDest = "";
+                if (claim.claimant != null) {
+                    if (claim.claimant.city != null && !claim.claimant.city.isBlank()) {
+                        defaultDest = claim.claimant.city + " Collection Drop-off";
+                    } else if (claim.claimant.fullName != null) {
+                        defaultDest = claim.claimant.fullName + " Collection Point";
+                    }
+                }
+                delivery.deliveryAddress = defaultDest.isBlank() ? "Recipient Destination Address" : defaultDest;
+                delivery.status = DeliveryStatus.PENDING;
+                delivery.createdAt = LocalDateTime.now();
+                deliveries.save(delivery);
+            }
         } else {
             // Rejection refunds reserved meals back to donation
             Query query = new Query(Criteria.where("_id").is(claim.donation.id));
@@ -815,13 +820,20 @@ public class ApiController {
                 new ResponseStatusException(HttpStatus.NOT_FOUND, "Driver not found"));
         requireRole(driver, Role.DRIVER);
 
+        if (deliveries.existsByDriverIdAndStatusIn(driver.id,
+                List.of(DeliveryStatus.ACCEPTED, DeliveryStatus.PICKED_UP, DeliveryStatus.IN_TRANSIT))) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Driver " + driver.fullName + " currently has an active delivery in progress");
+        }
+
         Delivery delivery = new Delivery();
         delivery.foodRequest = request;
         delivery.donation = donation;
         delivery.ngo = requester.role == Role.NGO ? requester : null;
         delivery.driver = driver;
         delivery.mealCount = request.requestedMeals;
+        delivery.pickupAddress = donation.pickupAddress;
         delivery.deliveryAddress = in.deliveryAddress().trim();
+        delivery.status = DeliveryStatus.ASSIGNED;
         deliveries.save(delivery);
 
         return ResponseEntity.status(HttpStatus.CREATED).body(deliveryMap(delivery));
@@ -834,8 +846,8 @@ public class ApiController {
             Authentication authentication,
             @Valid @RequestBody DeliveryInput in
     ) {
-        AppUser ngo = current(authentication);
-        requireRole(ngo, Role.NGO);
+        AppUser creator = current(authentication);
+        requireOneOf(creator, Role.NGO, Role.RECIPIENT, Role.RESTAURANT, Role.ADMIN);
 
         Donation donation = donations.findById(in.donationId())
                 .orElseThrow(() ->
@@ -859,15 +871,21 @@ public class ApiController {
             );
         }
 
-        AppUser driver = users.findById(in.driverId())
-                .orElseThrow(() ->
-                        new ResponseStatusException(
-                                HttpStatus.NOT_FOUND,
-                                "Driver not found"
-                        )
-                );
-
-        requireRole(driver, Role.DRIVER);
+        AppUser driver = null;
+        if (in.driverId() != null && !in.driverId().isBlank()) {
+            driver = users.findById(in.driverId())
+                    .orElseThrow(() ->
+                            new ResponseStatusException(
+                                    HttpStatus.NOT_FOUND,
+                                    "Driver not found"
+                            )
+                    );
+            requireRole(driver, Role.DRIVER);
+            if (deliveries.existsByDriverIdAndStatusIn(driver.id,
+                    List.of(DeliveryStatus.ACCEPTED, DeliveryStatus.PICKED_UP, DeliveryStatus.IN_TRANSIT))) {
+                throw new ResponseStatusException(HttpStatus.CONFLICT, "Driver " + driver.fullName + " currently has an active delivery in progress");
+            }
+        }
 
         // Atomic deduction
         Query query = new Query(Criteria.where("_id").is(in.donationId())
@@ -888,12 +906,13 @@ public class ApiController {
         );
 
         Delivery delivery = new Delivery();
-
         delivery.donation = updated;
-        delivery.ngo = ngo;
+        delivery.ngo = creator.role == Role.NGO ? creator : null;
         delivery.driver = driver;
         delivery.mealCount = in.mealCount();
+        delivery.pickupAddress = updated.pickupAddress;
         delivery.deliveryAddress = in.deliveryAddress().trim();
+        delivery.status = driver != null ? DeliveryStatus.ASSIGNED : DeliveryStatus.PENDING;
 
         deliveries.save(delivery);
 
@@ -911,202 +930,249 @@ public class ApiController {
             @Valid @RequestBody ClaimDeliveryInput in
     ) {
         AppUser requester = current(authentication);
-        requireOneOf(requester, Role.NGO, Role.RECIPIENT);
+        requireOneOf(requester, Role.NGO, Role.RECIPIENT, Role.ADMIN, Role.RESTAURANT);
         FoodClaim claim = claims.findById(claimId).orElseThrow(() ->
                 new ResponseStatusException(HttpStatus.NOT_FOUND, "Claim not found"));
-        if (claim.claimant == null || !claim.claimant.id.equals(requester.id)) {
+        if (claim.claimant == null || (!claim.claimant.id.equals(requester.id) && requester.role != Role.ADMIN
+                && (claim.donation == null || claim.donation.donor == null || !claim.donation.donor.id.equals(requester.id)))) {
             throw new ResponseStatusException(HttpStatus.FORBIDDEN, "This claim does not belong to your account");
         }
         if (claim.status != ClaimStatus.APPROVED && claim.status != ClaimStatus.CONFIRMED) {
             throw new ResponseStatusException(HttpStatus.CONFLICT, "The donor must approve this claim before delivery is arranged");
         }
-        if (deliveries.existsByClaimId(claim.id)) {
-            throw new ResponseStatusException(HttpStatus.CONFLICT, "A delivery already exists for this claim");
-        }
+
         AppUser driver = users.findById(in.driverId()).orElseThrow(() ->
                 new ResponseStatusException(HttpStatus.NOT_FOUND, "Driver not found"));
         requireRole(driver, Role.DRIVER);
 
-        Delivery delivery = new Delivery();
+        if (deliveries.existsByDriverIdAndStatusIn(driver.id,
+                List.of(DeliveryStatus.ACCEPTED, DeliveryStatus.PICKED_UP, DeliveryStatus.IN_TRANSIT))) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Driver " + driver.fullName + " currently has an active delivery in progress");
+        }
+
+        // Check if an auto-created delivery exists
+        Delivery delivery = deliveries.findByClaimId(claim.id).orElse(null);
+        if (delivery != null) {
+            if (delivery.status != DeliveryStatus.PENDING && delivery.status != DeliveryStatus.CANCELLED) {
+                throw new ResponseStatusException(HttpStatus.CONFLICT, "A delivery already exists for this claim");
+            }
+            delivery.driver = driver;
+            delivery.deliveryAddress = in.deliveryAddress().trim();
+            delivery.status = DeliveryStatus.ASSIGNED;
+            deliveries.save(delivery);
+            return ResponseEntity.status(HttpStatus.CREATED).body(deliveryMap(delivery));
+        }
+
+        delivery = new Delivery();
         delivery.claim = claim;
         delivery.donation = claim.donation;
-        delivery.ngo = requester.role == Role.NGO ? requester : null;
+        delivery.ngo = requester.role == Role.NGO ? requester : (claim.claimant != null && claim.claimant.role == Role.NGO ? claim.claimant : null);
         delivery.driver = driver;
         delivery.mealCount = claim.requestedMeals;
+        delivery.pickupAddress = claim.donation != null ? claim.donation.pickupAddress : "";
         delivery.deliveryAddress = in.deliveryAddress().trim();
+        delivery.status = DeliveryStatus.ASSIGNED;
         deliveries.save(delivery);
 
         return ResponseEntity.status(HttpStatus.CREATED).body(deliveryMap(delivery));
     }
 
-    // -------------------- DRIVER LOCATION TRACKING --------------------
+    // -------------------- DRIVER ASSIGNMENT --------------------
 
-    @PostMapping("/tracking")
-    public ResponseEntity<?> saveTrackingLocation(
-            Authentication authentication,
-            @Valid @RequestBody TrackingInput in
-    ) {
-        AppUser driver = current(authentication);
-        requireRole(driver, Role.DRIVER);
-
-        Delivery delivery = deliveries.findById(in.deliveryId()).orElseThrow(() ->
-                new ResponseStatusException(HttpStatus.NOT_FOUND, "Delivery not found"));
-        if (delivery.driver == null || !delivery.driver.id.equals(driver.id)) {
-            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "You can only share location for your assigned delivery");
-        }
-        if (Boolean.FALSE.equals(delivery.trackingEnabled) || delivery.status == DeliveryStatus.DELIVERED || delivery.status == DeliveryStatus.CANCELLED) {
-            throw new ResponseStatusException(HttpStatus.CONFLICT, "Tracking is disabled or closed for this delivery");
-        }
-        TrackingLocation location = new TrackingLocation();
-        location.deliveryId = delivery.id;
-        location.latitude = in.latitude();
-        location.longitude = in.longitude();
-        location.speed = in.speed();
-        location.recordedAt = LocalDateTime.now();
-        trackingLocations.save(location);
-
-        return ResponseEntity.status(HttpStatus.CREATED).body(trackingMap(location));
-    }
-
-    @PatchMapping("/deliveries/{id}/tracking")
-    public Map<String, Object> toggleTracking(
+    @RequestMapping(value = "/deliveries/{id}/assign", method = {RequestMethod.PUT, RequestMethod.POST})
+    public Map<String, Object> assignDriver(
             @PathVariable String id,
             Authentication authentication,
-            @Valid @RequestBody TrackingToggle in
+            @Valid @RequestBody DeliveryAssignInput in
     ) {
-        AppUser driver = current(authentication);
-        requireRole(driver, Role.DRIVER);
+        AppUser user = current(authentication);
         Delivery delivery = deliveries.findById(id).orElseThrow(() ->
                 new ResponseStatusException(HttpStatus.NOT_FOUND, "Delivery not found"));
-        if (delivery.driver == null || !delivery.driver.id.equals(driver.id)) {
-            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "You can only control tracking for your assigned delivery");
+
+        boolean isAdmin = user.role == Role.ADMIN;
+        boolean isDonor = delivery.donation != null && delivery.donation.donor != null && delivery.donation.donor.id.equals(user.id);
+        boolean isNgo = delivery.ngo != null && delivery.ngo.id.equals(user.id);
+        boolean isClaimant = delivery.claim != null && delivery.claim.claimant != null && delivery.claim.claimant.id.equals(user.id);
+        boolean isRequester = delivery.foodRequest != null && delivery.foodRequest.requester != null && delivery.foodRequest.requester.id.equals(user.id);
+
+        if (!isAdmin && !isDonor && !isNgo && !isClaimant && !isRequester) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "You are not authorized to assign a driver for this delivery");
         }
-        if (delivery.status == DeliveryStatus.DELIVERED || delivery.status == DeliveryStatus.CANCELLED) {
-            throw new ResponseStatusException(HttpStatus.CONFLICT, "Tracking is closed for this delivery");
+
+        if (delivery.status != DeliveryStatus.PENDING && delivery.status != DeliveryStatus.ASSIGNED) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Driver can only be assigned to pending or assigned deliveries");
         }
-        delivery.trackingEnabled = in.enabled();
+
+        AppUser driver = users.findById(in.driverId()).orElseThrow(() ->
+                new ResponseStatusException(HttpStatus.NOT_FOUND, "Driver not found"));
+        requireRole(driver, Role.DRIVER);
+
+        if (deliveries.existsByDriverIdAndStatusIn(driver.id,
+                List.of(DeliveryStatus.ACCEPTED, DeliveryStatus.PICKED_UP, DeliveryStatus.IN_TRANSIT))) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Driver " + driver.fullName + " currently has an active delivery in progress");
+        }
+
+        delivery.driver = driver;
+        if (in.deliveryAddress() != null && !in.deliveryAddress().isBlank()) {
+            delivery.deliveryAddress = in.deliveryAddress().trim();
+        }
+        delivery.status = DeliveryStatus.ASSIGNED;
         deliveries.save(delivery);
+
         return deliveryMap(delivery);
     }
 
-    @GetMapping("/tracking/delivery/{deliveryId}")
-    public List<Map<String, Object>> trackingHistory(
-            @PathVariable String deliveryId,
+    // -------------------- DRIVER ACCEPT / REJECT --------------------
+
+    @RequestMapping(value = "/deliveries/{id}/accept", method = {RequestMethod.PUT, RequestMethod.POST})
+    public Map<String, Object> acceptDelivery(
+            @PathVariable String id,
             Authentication authentication
     ) {
-        AppUser user = current(authentication);
-        Delivery delivery = deliveries.findById(deliveryId).orElseThrow(() ->
-                new ResponseStatusException(HttpStatus.NOT_FOUND, "Delivery not found"));
-        requireDeliveryParticipant(user, delivery);
-        return trackingLocations.findByDeliveryIdOrderByRecordedAtAsc(deliveryId)
-                .stream().map(this::trackingMap).toList();
-    }
+        AppUser driver = current(authentication);
+        requireRole(driver, Role.DRIVER);
 
-    @GetMapping("/tracking/delivery/{deliveryId}/latest")
-    public Map<String, Object> latestTracking(
-            @PathVariable String deliveryId,
-            Authentication authentication
-    ) {
-        AppUser user = current(authentication);
-        Delivery delivery = deliveries.findById(deliveryId).orElseThrow(() ->
+        Delivery delivery = deliveries.findById(id).orElseThrow(() ->
                 new ResponseStatusException(HttpStatus.NOT_FOUND, "Delivery not found"));
-        requireDeliveryParticipant(user, delivery);
-        return trackingLocations.findFirstByDeliveryIdOrderByRecordedAtDesc(deliveryId)
-                .map(this::trackingMap)
-                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "No location has been shared yet"));
-    }
 
-    private void requireDeliveryParticipant(AppUser user, Delivery delivery) {
-        boolean isDriver = delivery.driver != null && delivery.driver.id.equals(user.id);
-        boolean isNgo = delivery.ngo != null && delivery.ngo.id.equals(user.id);
-        boolean isClaimant = delivery.claim != null && delivery.claim.claimant != null
-                && delivery.claim.claimant.id.equals(user.id);
-        boolean isDonor = delivery.donation != null && delivery.donation.donor != null
-                && delivery.donation.donor.id.equals(user.id);
-        boolean isRequester = delivery.foodRequest != null && delivery.foodRequest.requester != null
-                && delivery.foodRequest.requester.id.equals(user.id);
-        if (!(isDriver || isNgo || isClaimant || isDonor || isRequester || user.role == Role.ADMIN)) {
-            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "You cannot access this delivery's location");
+        if (delivery.driver == null || !delivery.driver.id.equals(driver.id)) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "This delivery is not assigned to you");
         }
+
+        if (delivery.status != DeliveryStatus.ASSIGNED) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Only assigned deliveries can be accepted");
+        }
+
+        if (deliveries.existsByDriverIdAndStatusIn(driver.id,
+                List.of(DeliveryStatus.ACCEPTED, DeliveryStatus.PICKED_UP, DeliveryStatus.IN_TRANSIT))) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "You already have another active delivery in progress");
+        }
+
+        delivery.status = DeliveryStatus.ACCEPTED;
+        delivery.acceptedAt = LocalDateTime.now();
+        deliveries.save(delivery);
+
+        return deliveryMap(delivery);
     }
 
-    private Map<String, Object> trackingMap(TrackingLocation location) {
-        Map<String, Object> result = new LinkedHashMap<>();
-        result.put("id", location.id);
-        result.put("deliveryId", location.deliveryId);
-        result.put("latitude", location.latitude);
-        result.put("longitude", location.longitude);
-        result.put("speed", location.speed);
-        result.put("recordedAt", location.recordedAt);
-        return result;
+    @RequestMapping(value = "/deliveries/{id}/reject", method = {RequestMethod.PUT, RequestMethod.POST})
+    public Map<String, Object> rejectDelivery(
+            @PathVariable String id,
+            Authentication authentication,
+            @RequestBody(required = false) DeliveryRejectInput in
+    ) {
+        AppUser driver = current(authentication);
+        requireRole(driver, Role.DRIVER);
+
+        Delivery delivery = deliveries.findById(id).orElseThrow(() ->
+                new ResponseStatusException(HttpStatus.NOT_FOUND, "Delivery not found"));
+
+        if (delivery.driver == null || !delivery.driver.id.equals(driver.id)) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "This delivery is not assigned to you");
+        }
+
+        if (delivery.status != DeliveryStatus.ASSIGNED) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Only assigned deliveries can be rejected");
+        }
+
+        delivery.driver = null;
+        delivery.status = DeliveryStatus.PENDING;
+        delivery.failureReason = (in != null && in.reason() != null && !in.reason().isBlank())
+                ? "Driver rejected: " + in.reason().trim()
+                : "Driver rejected assignment";
+        deliveries.save(delivery);
+
+        return deliveryMap(delivery);
     }
 
-    // -------------------- LIST DRIVERS --------------------
+    // -------------------- LIST DELIVERIES (WITH STATUS FILTERS & ROLES) --------------------
 
-    @GetMapping("/drivers")
-    public List<Map<String, Object>> drivers(
+    @GetMapping("/deliveries")
+    public List<Map<String, Object>> listDeliveries(
+            @RequestParam(required = false) String status,
             Authentication authentication
     ) {
         AppUser user = current(authentication);
-        requireOneOf(user, Role.NGO, Role.RECIPIENT, Role.ADMIN);
-
-        return users.findByRole(Role.DRIVER)
-                .stream()
-                .map(driver -> {
-                    Map<String, Object> result = new LinkedHashMap<>();
-                    result.put("id", driver.id);
-                    result.put("fullName", driver.fullName);
-                    result.put("phone", Objects.toString(driver.phone, ""));
-                    result.put("city", Objects.toString(driver.city, ""));
-                    return result;
-                })
-                .toList();
-    }
-
-    // -------------------- MY DELIVERIES --------------------
-
-    @GetMapping("/deliveries/mine")
-    public List<Map<String, Object>> myDeliveries(
-            Authentication authentication
-    ) {
-        AppUser user = current(authentication);
-
-        List<Delivery> myDeliveryList;
+        List<Delivery> all;
 
         if (user.role == Role.ADMIN) {
-            myDeliveryList = deliveries.findAllByOrderByCreatedAtDesc();
+            all = deliveries.findAllByOrderByCreatedAtDesc();
         } else if (user.role == Role.DRIVER) {
-            myDeliveryList = deliveries.findByDriverIdOrderByCreatedAtDesc(user.id);
+            all = deliveries.findByDriverIdOrderByCreatedAtDesc(user.id);
         } else if (user.role == Role.NGO || user.role == Role.RECIPIENT) {
-            myDeliveryList = deliveries.findAllByOrderByCreatedAtDesc().stream()
+            all = deliveries.findAllByOrderByCreatedAtDesc().stream()
                     .filter(d -> (d.ngo != null && user.id.equals(d.ngo.id))
                             || (d.claim != null && d.claim.claimant != null && user.id.equals(d.claim.claimant.id))
                             || (d.foodRequest != null && d.foodRequest.requester != null && user.id.equals(d.foodRequest.requester.id)))
                     .toList();
         } else if (user.role == Role.RESTAURANT) {
-            myDeliveryList = deliveries.findByDonationDonorIdOrderByCreatedAtDesc(user.id);
+            all = deliveries.findByDonationDonorIdOrderByCreatedAtDesc(user.id);
         } else {
-            throw new ResponseStatusException(
-                    HttpStatus.FORBIDDEN,
-                    "This action is available to NGOs, recipients, donors and drivers"
-            );
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Access denied");
         }
 
-        return myDeliveryList.stream()
-                .map(this::deliveryMap)
-                .toList();
+        if (status != null && !status.isBlank() && !status.equalsIgnoreCase("ALL")) {
+            try {
+                DeliveryStatus filterStatus = DeliveryStatus.valueOf(status.trim().toUpperCase(Locale.ROOT));
+                all = all.stream().filter(d -> d.status == filterStatus).toList();
+            } catch (IllegalArgumentException ignored) {}
+        }
+
+        return all.stream().map(this::deliveryMap).toList();
     }
 
-    // -------------------- UPDATE DELIVERY STATUS --------------------
+    @GetMapping("/deliveries/{id}")
+    public Map<String, Object> getDelivery(
+            @PathVariable String id,
+            Authentication authentication
+    ) {
+        AppUser user = current(authentication);
+        Delivery delivery = deliveries.findById(id).orElseThrow(() ->
+                new ResponseStatusException(HttpStatus.NOT_FOUND, "Delivery not found"));
+        requireDeliveryParticipant(user, delivery);
+        Map<String, Object> res = deliveryMap(delivery);
 
-    @PatchMapping("/deliveries/{id}/status")
+        // Include proof history
+        List<Map<String, Object>> proofs = deliveryProofs.findByDeliveryIdOrderByDeliveredAtDesc(delivery.id)
+                .stream().map(p -> {
+                    Map<String, Object> m = new LinkedHashMap<>();
+                    m.put("id", p.id);
+                    m.put("deliveryId", p.deliveryId);
+                    m.put("proofImageUrl", p.proofImageFile != null ? "/api/files/" + p.proofImageFile : null);
+                    m.put("receiverName", p.receiverName);
+                    m.put("latitude", p.latitude);
+                    m.put("longitude", p.longitude);
+                    m.put("deliveredAt", p.deliveredAt);
+                    m.put("recipientConfirmed", p.recipientConfirmed);
+                    m.put("confirmedAt", p.confirmedAt);
+                    m.put("recipientNotes", p.recipientNotes);
+                    return m;
+                }).toList();
+        res.put("proofs", proofs);
+
+        // Include latest tracking
+        trackingLocations.findFirstByDeliveryIdOrderByRecordedAtDesc(delivery.id)
+                .ifPresent(loc -> res.put("latestTracking", trackingMap(loc)));
+
+        return res;
+    }
+
+    @GetMapping("/deliveries/mine")
+    public List<Map<String, Object>> myDeliveries(
+            Authentication authentication
+    ) {
+        return listDeliveries(null, authentication);
+    }
+
+    // -------------------- UPDATE DELIVERY STATUS (STATE MACHINE) --------------------
+
+    @RequestMapping(value = "/deliveries/{id}/status", method = {RequestMethod.PUT, RequestMethod.PATCH})
     public Map<String, Object> updateDelivery(
             @PathVariable String id,
             Authentication authentication,
-            @Valid @RequestBody StatusInput in
+            @Valid @RequestBody DeliveryStatusUpdateInput in
     ) {
         AppUser user = current(authentication);
-
         Delivery delivery = deliveries.findById(id)
                 .orElseThrow(() ->
                         new ResponseStatusException(
@@ -1121,9 +1187,11 @@ public class ApiController {
                 && delivery.claim.claimant.id.equals(user.id);
         boolean isRequester = delivery.foodRequest != null && delivery.foodRequest.requester != null
                 && delivery.foodRequest.requester.id.equals(user.id);
+        boolean isDonor = delivery.donation != null && delivery.donation.donor != null
+                && delivery.donation.donor.id.equals(user.id);
         boolean isAdmin = user.role == Role.ADMIN;
 
-        if (!isDriver && !isNgo && !isClaimant && !isRequester && !isAdmin) {
+        if (!isDriver && !isNgo && !isClaimant && !isRequester && !isDonor && !isAdmin) {
             throw new ResponseStatusException(
                     HttpStatus.FORBIDDEN,
                     "Not your delivery"
@@ -1131,7 +1199,6 @@ public class ApiController {
         }
 
         DeliveryStatus nextStatus;
-
         try {
             nextStatus = DeliveryStatus.valueOf(
                     in.status().trim().toUpperCase(Locale.ROOT)
@@ -1139,26 +1206,38 @@ public class ApiController {
         } catch (Exception e) {
             throw new ResponseStatusException(
                     HttpStatus.BAD_REQUEST,
-                    "Invalid delivery status"
+                    "Invalid delivery status: " + in.status()
             );
         }
 
         boolean validTransition =
-                (delivery.status == DeliveryStatus.ASSIGNED && (nextStatus == DeliveryStatus.PICKED_UP || nextStatus == DeliveryStatus.CANCELLED))
-                        || (delivery.status == DeliveryStatus.PICKED_UP && (nextStatus == DeliveryStatus.IN_TRANSIT || nextStatus == DeliveryStatus.DELIVERED))
-                        || (delivery.status == DeliveryStatus.IN_TRANSIT && nextStatus == DeliveryStatus.DELIVERED)
+                (delivery.status == DeliveryStatus.PENDING && (nextStatus == DeliveryStatus.ASSIGNED || nextStatus == DeliveryStatus.CANCELLED))
+                        || (delivery.status == DeliveryStatus.ASSIGNED && (nextStatus == DeliveryStatus.ACCEPTED || nextStatus == DeliveryStatus.PICKED_UP || nextStatus == DeliveryStatus.CANCELLED || nextStatus == DeliveryStatus.PENDING))
+                        || (delivery.status == DeliveryStatus.ACCEPTED && (nextStatus == DeliveryStatus.PICKED_UP || nextStatus == DeliveryStatus.CANCELLED || nextStatus == DeliveryStatus.FAILED))
+                        || (delivery.status == DeliveryStatus.PICKED_UP && (nextStatus == DeliveryStatus.IN_TRANSIT || nextStatus == DeliveryStatus.DELIVERED || nextStatus == DeliveryStatus.FAILED))
+                        || (delivery.status == DeliveryStatus.IN_TRANSIT && (nextStatus == DeliveryStatus.DELIVERED || nextStatus == DeliveryStatus.FAILED))
+                        || (delivery.status == DeliveryStatus.DELIVERED && (nextStatus == DeliveryStatus.CONFIRMED || nextStatus == DeliveryStatus.FAILED))
                         || (delivery.status == nextStatus);
+
         if (!validTransition) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid delivery status transition");
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "Invalid delivery transition from " + delivery.status + " to " + nextStatus);
         }
+
         if ((nextStatus == DeliveryStatus.PICKED_UP || nextStatus == DeliveryStatus.IN_TRANSIT || nextStatus == DeliveryStatus.DELIVERED)
                 && !isDriver && !isAdmin) {
             throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Only the assigned driver can update transit progress");
         }
-        if (nextStatus == DeliveryStatus.CANCELLED && delivery.status != DeliveryStatus.ASSIGNED) {
-            throw new ResponseStatusException(HttpStatus.CONFLICT, "Only assigned deliveries can be cancelled");
+
+        if (nextStatus == DeliveryStatus.CONFIRMED && !isNgo && !isClaimant && !isRequester && !isAdmin) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Only the recipient organization or claimant can confirm delivery");
         }
-        if (nextStatus == DeliveryStatus.CANCELLED && delivery.status == DeliveryStatus.ASSIGNED) {
+
+        if (nextStatus == DeliveryStatus.CANCELLED) {
+            if (delivery.status != DeliveryStatus.PENDING && delivery.status != DeliveryStatus.ASSIGNED && delivery.status != DeliveryStatus.ACCEPTED) {
+                throw new ResponseStatusException(HttpStatus.CONFLICT, "Cannot cancel a delivery that is already picked up or in transit");
+            }
+            // Refund meals atomically to donation
             if (delivery.donation != null) {
                 Query query = new Query(Criteria.where("_id").is(delivery.donation.id));
                 Update update = new Update().inc("remainingMeals", delivery.mealCount);
@@ -1184,9 +1263,284 @@ public class ApiController {
                 claims.save(delivery.claim);
             }
         }
+
         delivery.status = nextStatus;
 
-        if (nextStatus == DeliveryStatus.DELIVERED) {
+        if (nextStatus == DeliveryStatus.ACCEPTED) {
+            delivery.acceptedAt = LocalDateTime.now();
+        } else if (nextStatus == DeliveryStatus.PICKED_UP) {
+            delivery.pickedUpAt = LocalDateTime.now();
+        } else if (nextStatus == DeliveryStatus.DELIVERED) {
+            delivery.deliveredAt = LocalDateTime.now();
+            if (delivery.foodRequest != null) {
+                delivery.foodRequest.status = RequestStatus.FULFILLED;
+                requests.save(delivery.foodRequest);
+            }
+            if (delivery.claim != null) {
+                delivery.claim.status = ClaimStatus.COMPLETED;
+                claims.save(delivery.claim);
+            }
+        } else if (nextStatus == DeliveryStatus.CONFIRMED) {
+            delivery.confirmedAt = LocalDateTime.now();
+            delivery.recipientConfirmed = true;
+            if (delivery.claim != null) {
+                delivery.claim.status = ClaimStatus.COMPLETED;
+                claims.save(delivery.claim);
+            }
+        } else if (nextStatus == DeliveryStatus.FAILED) {
+            delivery.failedAt = LocalDateTime.now();
+            delivery.failureReason = in.failureReason() != null ? in.failureReason() : "Delivery marked failed";
+        }
+
+        if (in.receiverName() != null && !in.receiverName().isBlank()) {
+            delivery.receiverName = in.receiverName().trim();
+        }
+        if (in.latitude() != null) delivery.deliveryLatitude = in.latitude();
+        if (in.longitude() != null) delivery.deliveryLongitude = in.longitude();
+
+        deliveries.save(delivery);
+
+        return deliveryMap(delivery);
+    }
+
+    // -------------------- RECIPIENT CONFIRMATION & FAILURE REPORTING --------------------
+
+    @RequestMapping(value = "/deliveries/{id}/confirm", method = {RequestMethod.PUT, RequestMethod.POST})
+    public Map<String, Object> confirmDelivery(
+            @PathVariable String id,
+            Authentication authentication,
+            @RequestBody(required = false) DeliveryConfirmInput in
+    ) {
+        AppUser user = current(authentication);
+        Delivery delivery = deliveries.findById(id).orElseThrow(() ->
+                new ResponseStatusException(HttpStatus.NOT_FOUND, "Delivery not found"));
+
+        boolean isNgo = delivery.ngo != null && delivery.ngo.id.equals(user.id);
+        boolean isClaimant = delivery.claim != null && delivery.claim.claimant != null && delivery.claim.claimant.id.equals(user.id);
+        boolean isRequester = delivery.foodRequest != null && delivery.foodRequest.requester != null && delivery.foodRequest.requester.id.equals(user.id);
+        boolean isAdmin = user.role == Role.ADMIN;
+
+        if (!isNgo && !isClaimant && !isRequester && !isAdmin) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Only the recipient organization or claimant can confirm delivery receipt");
+        }
+
+        if (delivery.status != DeliveryStatus.DELIVERED) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Can only confirm delivery after it has been marked DELIVERED by driver");
+        }
+
+        delivery.status = DeliveryStatus.CONFIRMED;
+        delivery.recipientConfirmed = true;
+        delivery.confirmedAt = LocalDateTime.now();
+        if (in != null && in.notes() != null && !in.notes().isBlank()) {
+            delivery.recipientNotes = in.notes().trim();
+        }
+
+        deliveryProofs.findFirstByDeliveryIdOrderByDeliveredAtDesc(delivery.id).ifPresent(p -> {
+            p.recipientConfirmed = true;
+            p.confirmedAt = LocalDateTime.now();
+            if (delivery.recipientNotes != null) p.recipientNotes = delivery.recipientNotes;
+            deliveryProofs.save(p);
+        });
+
+        if (delivery.claim != null) {
+            delivery.claim.status = ClaimStatus.COMPLETED;
+            claims.save(delivery.claim);
+        }
+
+        deliveries.save(delivery);
+        return deliveryMap(delivery);
+    }
+
+    @RequestMapping(value = "/deliveries/{id}/fail", method = {RequestMethod.PUT, RequestMethod.POST})
+    public Map<String, Object> reportDeliveryFailed(
+            @PathVariable String id,
+            Authentication authentication,
+            @Valid @RequestBody DeliveryFailInput in
+    ) {
+        AppUser user = current(authentication);
+        Delivery delivery = deliveries.findById(id).orElseThrow(() ->
+                new ResponseStatusException(HttpStatus.NOT_FOUND, "Delivery not found"));
+
+        requireDeliveryParticipant(user, delivery);
+
+        if (delivery.status == DeliveryStatus.CONFIRMED || delivery.status == DeliveryStatus.CANCELLED) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Cannot mark a confirmed or cancelled delivery as failed");
+        }
+
+        delivery.status = DeliveryStatus.FAILED;
+        delivery.failureReason = in.reason().trim();
+        delivery.failedAt = LocalDateTime.now();
+        deliveries.save(delivery);
+
+        return deliveryMap(delivery);
+    }
+
+    // -------------------- DRIVER LOCATION TRACKING (REAL-TIME GPS) --------------------
+
+    @PostMapping("/deliveries/{id}/tracking")
+    public ResponseEntity<?> saveDeliveryTracking(
+            @PathVariable String id,
+            Authentication authentication,
+            @Valid @RequestBody DeliveryLocationInput in
+    ) {
+        AppUser driver = current(authentication);
+        Delivery delivery = deliveries.findById(id).orElseThrow(() ->
+                new ResponseStatusException(HttpStatus.NOT_FOUND, "Delivery not found"));
+
+        if (!driver.id.equals(delivery.driver != null ? delivery.driver.id : null) && driver.role != Role.ADMIN) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "You can only broadcast location for your assigned delivery");
+        }
+
+        if (Boolean.FALSE.equals(delivery.trackingEnabled) || delivery.status == DeliveryStatus.DELIVERED
+                || delivery.status == DeliveryStatus.CONFIRMED || delivery.status == DeliveryStatus.CANCELLED || delivery.status == DeliveryStatus.FAILED) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Tracking is disabled or closed for this delivery");
+        }
+
+        TrackingLocation location = new TrackingLocation();
+        location.deliveryId = delivery.id;
+        location.latitude = in.latitude();
+        location.longitude = in.longitude();
+        location.speed = in.speed();
+        location.recordedAt = LocalDateTime.now();
+        trackingLocations.save(location);
+
+        delivery.deliveryLatitude = in.latitude();
+        delivery.deliveryLongitude = in.longitude();
+        deliveries.save(delivery);
+
+        return ResponseEntity.status(HttpStatus.CREATED).body(trackingMap(location));
+    }
+
+    @PostMapping("/tracking")
+    public ResponseEntity<?> saveTrackingLocation(
+            Authentication authentication,
+            @Valid @RequestBody TrackingInput in
+    ) {
+        return saveDeliveryTracking(in.deliveryId(), authentication,
+                new DeliveryLocationInput(in.latitude(), in.longitude(), in.speed()));
+    }
+
+    @RequestMapping(value = "/deliveries/{id}/tracking", method = {RequestMethod.GET})
+    public List<Map<String, Object>> getDeliveryTracking(
+            @PathVariable String id,
+            Authentication authentication
+    ) {
+        AppUser user = current(authentication);
+        Delivery delivery = deliveries.findById(id).orElseThrow(() ->
+                new ResponseStatusException(HttpStatus.NOT_FOUND, "Delivery not found"));
+        requireDeliveryParticipant(user, delivery);
+        return trackingLocations.findByDeliveryIdOrderByRecordedAtAsc(id)
+                .stream().map(this::trackingMap).toList();
+    }
+
+    @GetMapping("/deliveries/{id}/tracking/latest")
+    public Map<String, Object> getLatestDeliveryTracking(
+            @PathVariable String id,
+            Authentication authentication
+    ) {
+        AppUser user = current(authentication);
+        Delivery delivery = deliveries.findById(id).orElseThrow(() ->
+                new ResponseStatusException(HttpStatus.NOT_FOUND, "Delivery not found"));
+        requireDeliveryParticipant(user, delivery);
+        return trackingLocations.findFirstByDeliveryIdOrderByRecordedAtDesc(id)
+                .map(this::trackingMap)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "No location has been shared yet"));
+    }
+
+    @PatchMapping("/deliveries/{id}/tracking")
+    public Map<String, Object> toggleTracking(
+            @PathVariable String id,
+            Authentication authentication,
+            @Valid @RequestBody TrackingToggle in
+    ) {
+        AppUser driver = current(authentication);
+        requireRole(driver, Role.DRIVER);
+        Delivery delivery = deliveries.findById(id).orElseThrow(() ->
+                new ResponseStatusException(HttpStatus.NOT_FOUND, "Delivery not found"));
+        if (delivery.driver == null || !delivery.driver.id.equals(driver.id)) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "You can only control tracking for your assigned delivery");
+        }
+        if (delivery.status == DeliveryStatus.DELIVERED || delivery.status == DeliveryStatus.CONFIRMED || delivery.status == DeliveryStatus.CANCELLED || delivery.status == DeliveryStatus.FAILED) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Tracking is closed for this delivery");
+        }
+        delivery.trackingEnabled = in.enabled();
+        deliveries.save(delivery);
+        return deliveryMap(delivery);
+    }
+
+    @GetMapping("/tracking/delivery/{deliveryId}")
+    public List<Map<String, Object>> trackingHistory(
+            @PathVariable String deliveryId,
+            Authentication authentication
+    ) {
+        return getDeliveryTracking(deliveryId, authentication);
+    }
+
+    @GetMapping("/tracking/delivery/{deliveryId}/latest")
+    public Map<String, Object> latestTracking(
+            @PathVariable String deliveryId,
+            Authentication authentication
+    ) {
+        return getLatestDeliveryTracking(deliveryId, authentication);
+    }
+
+    // -------------------- UPLOAD DELIVERY PROOF --------------------
+
+    @PostMapping(
+            value = "/deliveries/{id}/proof",
+            consumes = MediaType.MULTIPART_FORM_DATA_VALUE
+    )
+    public Map<String, Object> uploadProof(
+            @PathVariable String id,
+            Authentication authentication,
+            @RequestPart("image") MultipartFile image,
+            @RequestParam(value = "receiverName", required = false) String receiverName,
+            @RequestParam(value = "latitude", required = false) Double latitude,
+            @RequestParam(value = "longitude", required = false) Double longitude
+    ) throws IOException {
+
+        AppUser user = current(authentication);
+
+        Delivery delivery = deliveries.findById(id)
+                .orElseThrow(() ->
+                        new ResponseStatusException(
+                                HttpStatus.NOT_FOUND,
+                                "Delivery not found"
+                        )
+                );
+
+        boolean isDriver = delivery.driver != null && delivery.driver.id.equals(user.id);
+        boolean isNgo = delivery.ngo != null && delivery.ngo.id.equals(user.id);
+        boolean isAdmin = user.role == Role.ADMIN;
+
+        if (!isDriver && !isNgo && !isAdmin) {
+            throw new ResponseStatusException(
+                    HttpStatus.FORBIDDEN,
+                    "Not your delivery"
+            );
+        }
+
+        String filename = storeImage(image);
+
+        DeliveryProof proof = new DeliveryProof();
+        proof.deliveryId = delivery.id;
+        proof.proofImageFile = filename;
+        proof.receiverName = receiverName != null && !receiverName.isBlank() ? receiverName.trim() : delivery.receiverName;
+        proof.latitude = latitude;
+        proof.longitude = longitude;
+        proof.deliveredAt = LocalDateTime.now();
+        deliveryProofs.save(proof);
+
+        delivery.proofImageFile = filename;
+        if (proof.receiverName != null) {
+            delivery.receiverName = proof.receiverName;
+        }
+        if (latitude != null) delivery.deliveryLatitude = latitude;
+        if (longitude != null) delivery.deliveryLongitude = longitude;
+
+        // If driver uploads handover proof while in transit or picked up, mark as DELIVERED
+        if (delivery.status == DeliveryStatus.IN_TRANSIT || delivery.status == DeliveryStatus.PICKED_UP) {
+            delivery.status = DeliveryStatus.DELIVERED;
             delivery.deliveredAt = LocalDateTime.now();
             if (delivery.foodRequest != null) {
                 delivery.foodRequest.status = RequestStatus.FULFILLED;
@@ -1203,42 +1557,68 @@ public class ApiController {
         return deliveryMap(delivery);
     }
 
-    // -------------------- UPLOAD DELIVERY PROOF --------------------
+    // -------------------- ADMIN SUMMARY & STATS --------------------
 
-    @PostMapping(
-            value = "/deliveries/{id}/proof",
-            consumes = MediaType.MULTIPART_FORM_DATA_VALUE
-    )
-    public Map<String, Object> uploadProof(
-            @PathVariable String id,
-            Authentication authentication,
-            @RequestPart("image") MultipartFile image
-    ) throws IOException {
-
+    @GetMapping("/deliveries/summary")
+    public Map<String, Object> deliverySummary(Authentication authentication) {
         AppUser user = current(authentication);
+        requireRole(user, Role.ADMIN);
 
-        Delivery delivery = deliveries.findById(id)
-                .orElseThrow(() ->
-                        new ResponseStatusException(
-                                HttpStatus.NOT_FOUND,
-                                "Delivery not found"
-                        )
-                );
+        Map<String, Object> sum = new LinkedHashMap<>();
+        sum.put("totalDeliveries", deliveries.count());
+        sum.put("pendingDeliveries", deliveries.countByStatus(DeliveryStatus.PENDING));
+        sum.put("assignedDeliveries", deliveries.countByStatus(DeliveryStatus.ASSIGNED));
+        sum.put("acceptedDeliveries", deliveries.countByStatus(DeliveryStatus.ACCEPTED));
+        sum.put("pickedUpDeliveries", deliveries.countByStatus(DeliveryStatus.PICKED_UP));
+        sum.put("inTransitDeliveries", deliveries.countByStatus(DeliveryStatus.IN_TRANSIT));
+        sum.put("deliveredDeliveries", deliveries.countByStatus(DeliveryStatus.DELIVERED));
+        sum.put("confirmedDeliveries", deliveries.countByStatus(DeliveryStatus.CONFIRMED));
+        sum.put("failedDeliveries", deliveries.countByStatus(DeliveryStatus.FAILED));
+        sum.put("cancelledDeliveries", deliveries.countByStatus(DeliveryStatus.CANCELLED));
 
-        boolean isDriver = delivery.driver != null && delivery.driver.id.equals(user.id);
-        boolean isNgo = delivery.ngo != null && delivery.ngo.id.equals(user.id);
+        long totalMealsDelivered = deliveries.findByStatusOrderByCreatedAtDesc(DeliveryStatus.DELIVERED).stream()
+                .mapToLong(d -> d.mealCount != null ? d.mealCount : 0).sum()
+                + deliveries.findByStatusOrderByCreatedAtDesc(DeliveryStatus.CONFIRMED).stream()
+                .mapToLong(d -> d.mealCount != null ? d.mealCount : 0).sum();
+        sum.put("totalMealsDelivered", totalMealsDelivered);
 
-        if (!isDriver && !isNgo) {
-            throw new ResponseStatusException(
-                    HttpStatus.FORBIDDEN,
-                    "Not your delivery"
-            );
-        }
+        List<AppUser> allDrivers = users.findByRole(Role.DRIVER);
+        sum.put("totalDrivers", allDrivers.size());
+        long availableDrivers = allDrivers.stream()
+                .filter(d -> !deliveries.existsByDriverIdAndStatusIn(d.id,
+                        List.of(DeliveryStatus.ACCEPTED, DeliveryStatus.PICKED_UP, DeliveryStatus.IN_TRANSIT)))
+                .count();
+        sum.put("availableDrivers", availableDrivers);
 
-        delivery.proofImageFile = storeImage(image);
-        deliveries.save(delivery);
+        return sum;
+    }
 
-        return deliveryMap(delivery);
+    // -------------------- LIST DRIVERS WITH AVAILABILITY --------------------
+
+    @GetMapping("/drivers")
+    public List<Map<String, Object>> drivers(
+            Authentication authentication
+    ) {
+        AppUser user = current(authentication);
+        requireOneOf(user, Role.NGO, Role.RECIPIENT, Role.RESTAURANT, Role.ADMIN);
+
+        return users.findByRole(Role.DRIVER)
+                .stream()
+                .map(driver -> {
+                    Map<String, Object> result = new LinkedHashMap<>();
+                    result.put("id", driver.id);
+                    result.put("fullName", driver.fullName);
+                    result.put("phone", Objects.toString(driver.phone, ""));
+                    result.put("city", Objects.toString(driver.city, ""));
+
+                    boolean busy = deliveries.existsByDriverIdAndStatusIn(driver.id,
+                            List.of(DeliveryStatus.ACCEPTED, DeliveryStatus.PICKED_UP, DeliveryStatus.IN_TRANSIT));
+                    result.put("available", !busy);
+                    result.put("activeDeliveries", deliveries.findByDriverIdAndStatusIn(driver.id,
+                            List.of(DeliveryStatus.ASSIGNED, DeliveryStatus.ACCEPTED, DeliveryStatus.PICKED_UP, DeliveryStatus.IN_TRANSIT)).size());
+                    return result;
+                })
+                .toList();
     }
 
     // -------------------- SERVE UPLOADED IMAGES --------------------
@@ -1336,7 +1716,44 @@ public class ApiController {
         }
     }
 
+    private void requireDeliveryParticipant(AppUser user, Delivery delivery) {
+        boolean isDriver = delivery.driver != null && delivery.driver.id.equals(user.id);
+        boolean isNgo = delivery.ngo != null && delivery.ngo.id.equals(user.id);
+        boolean isClaimant = delivery.claim != null && delivery.claim.claimant != null
+                && delivery.claim.claimant.id.equals(user.id);
+        boolean isDonor = delivery.donation != null && delivery.donation.donor != null
+                && delivery.donation.donor.id.equals(user.id);
+        boolean isRequester = delivery.foodRequest != null && delivery.foodRequest.requester != null
+                && delivery.foodRequest.requester.id.equals(user.id);
+        if (!(isDriver || isNgo || isClaimant || isDonor || isRequester || user.role == Role.ADMIN)) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "You cannot access this delivery's details");
+        }
+    }
+
     // -------------------- RESPONSE MAPPERS --------------------
+
+    private Map<String, Object> userMap(AppUser user) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("id", user.id);
+        result.put("fullName", user.fullName);
+        result.put("organisationName", Objects.toString(user.organisationName, ""));
+        result.put("email", user.email);
+        result.put("phone", Objects.toString(user.phone, ""));
+        result.put("city", Objects.toString(user.city, ""));
+        result.put("role", user.role.name());
+        return result;
+    }
+
+    private Map<String, Object> trackingMap(TrackingLocation location) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("id", location.id);
+        result.put("deliveryId", location.deliveryId);
+        result.put("latitude", location.latitude);
+        result.put("longitude", location.longitude);
+        result.put("speed", location.speed);
+        result.put("recordedAt", location.recordedAt);
+        return result;
+    }
 
     private Map<String, Object> donationMap(Donation donation) {
         Map<String, Object> result = new LinkedHashMap<>();
@@ -1459,32 +1876,40 @@ public class ApiController {
         );
 
         if (delivery.driver != null) {
+            result.put("driverId", delivery.driver.id);
             result.put("driverName", delivery.driver.fullName);
             result.put("driverPhone", Objects.toString(delivery.driver.phone, ""));
         } else {
-            result.put("driverName", "Assigned Driver");
+            result.put("driverId", null);
+            result.put("driverName", "Unassigned Driver");
             result.put("driverPhone", "");
         }
 
         if (delivery.donation != null && delivery.donation.donor != null) {
+            result.put("donorId", delivery.donation.donor.id);
             result.put("donorName", delivery.donation.sourceName != null && !delivery.donation.sourceName.isBlank()
                     ? delivery.donation.sourceName
                     : (delivery.donation.donor.organisationName == null || delivery.donation.donor.organisationName.isBlank()
                     ? delivery.donation.donor.fullName : delivery.donation.donor.organisationName));
             result.put("donorPhone", Objects.toString(delivery.donation.donor.phone, ""));
-            result.put("pickupAddress", delivery.donation.pickupAddress);
+            result.put("pickupAddress", delivery.pickupAddress != null && !delivery.pickupAddress.isBlank()
+                    ? delivery.pickupAddress : delivery.donation.pickupAddress);
         } else if (delivery.donation != null) {
+            result.put("donorId", null);
             result.put("donorName", delivery.donation.sourceName != null ? delivery.donation.sourceName : "Donor");
             result.put("donorPhone", "");
-            result.put("pickupAddress", delivery.donation.pickupAddress);
+            result.put("pickupAddress", delivery.pickupAddress != null && !delivery.pickupAddress.isBlank()
+                    ? delivery.pickupAddress : delivery.donation.pickupAddress);
         } else {
+            result.put("donorId", null);
             result.put("donorName", "Donor");
             result.put("donorPhone", "");
-            result.put("pickupAddress", "");
+            result.put("pickupAddress", delivery.pickupAddress != null ? delivery.pickupAddress : "");
         }
 
         AppUser recipient = delivery.claim != null ? delivery.claim.claimant
                 : (delivery.foodRequest != null ? delivery.foodRequest.requester : delivery.ngo);
+        result.put("recipientId", recipient != null ? recipient.id : null);
         result.put("recipientName", recipient == null ? "Community recipient" :
                 (recipient.organisationName == null || recipient.organisationName.isBlank() ? recipient.fullName : recipient.organisationName));
         result.put("recipientPhone", recipient == null ? "" : Objects.toString(recipient.phone, ""));
@@ -1493,6 +1918,17 @@ public class ApiController {
         result.put("status", delivery.status);
         result.put("trackingEnabled", delivery.trackingEnabled);
         result.put("createdAt", delivery.createdAt);
+        result.put("acceptedAt", delivery.acceptedAt);
+        result.put("pickedUpAt", delivery.pickedUpAt);
+        result.put("deliveredAt", delivery.deliveredAt);
+        result.put("confirmedAt", delivery.confirmedAt);
+        result.put("failedAt", delivery.failedAt);
+        result.put("failureReason", delivery.failureReason);
+        result.put("receiverName", delivery.receiverName);
+        result.put("recipientConfirmed", delivery.recipientConfirmed != null && delivery.recipientConfirmed);
+        result.put("recipientNotes", delivery.recipientNotes);
+        result.put("deliveryLatitude", delivery.deliveryLatitude);
+        result.put("deliveryLongitude", delivery.deliveryLongitude);
 
         result.put(
                 "proofImageUrl",

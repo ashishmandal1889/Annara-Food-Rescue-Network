@@ -1,22 +1,23 @@
-# Annara Food Rescue Network — MongoDB Migration & Completion Notes
+# Annara Food Rescue Network — MongoDB Migration & Delivery Management Completion Notes
 
-## 1. Migration Overview
-- **Objective**: Complete end-to-end migration from relational MySQL/JPA to MongoDB with atomic conditional updates, role authorization, and production readiness.
+## 1. Upgrade & Migration Overview
+- **Objective**: Complete end-to-end delivery management system with MongoDB document persistence, driver assignment & acceptance workflows, real-time GPS tracking (Leaflet/OpenStreetMap), proof-of-delivery photo documentation, and recipient confirmation.
 - **Backend Framework**: Spring Boot 3.4.4, Java 24 (source level 17).
 - **Primary Database**: MongoDB (configured for local MongoDB 8.2 & MongoDB Atlas via `MONGODB_URI`).
-- **Frontend**: React 18/19 with Vite, pure responsive CSS (`style.css`), and Lucide React icons.
+- **Frontend**: React 19 with Vite 8, Leaflet OpenStreetMap interactive GPS tracking, responsive CSS (`style.css`), and Lucide React icons.
 
 ---
 
-## 2. Migrated Components
+## 2. Delivery Management System Components
 
 ### A. Document Collections
-1. `users` (`com.annara.entity.AppUser`): MongoDB document with `@Indexed(unique = true)` on `email`, index on `role`.
-2. `donations` (`com.annara.entity.Donation`): Stores meal availability, pickup window, image filename, and `@DocumentReference` to donor.
-3. `claims` (`com.annara.entity.FoodClaim`): Stores meal reservations, claim status, references to donation and claimant.
-4. `food_requests` (`com.annara.entity.FoodRequest`): Stores community requests with urgency levels, references to requester and matched donation.
-5. `deliveries` (`com.annara.entity.Delivery`): Stores delivery status machine, driver assignment, drop-off address, handover photo proof, and references.
+1. `users` (`com.annara.entity.AppUser`): Role-based accounts for Donors, NGOs, Community Recipients, Delivery Drivers, and Admins.
+2. `donations` (`com.annara.entity.Donation`): Food quantity, pickup window, image filename, and donor reference.
+3. `claims` (`com.annara.entity.FoodClaim`): Portions claimed, atomic reservation tracking, and donor approval.
+4. `food_requests` (`com.annara.entity.FoodRequest`): Community hunger requests with priority ratings and donor matching.
+5. `deliveries` (`com.annara.entity.Delivery`): Full delivery lifecycle state machine (`PENDING`, `ASSIGNED`, `ACCEPTED`, `PICKED_UP`, `IN_TRANSIT`, `DELIVERED`, `CONFIRMED`, `CANCELLED`, `FAILED`), timestamps, driver reference, recipient confirmation, and handover coordinates.
 6. `tracking_locations` (`com.annara.entity.TrackingLocation`): Real-time coordinates and speed with compound index on `(deliveryId, recordedAt)`.
+7. `delivery_proofs` (`com.annara.entity.DeliveryProof`): Handover proof photos, receiver name, GPS drop-off coordinates, recipient confirmation status, and timestamps.
 
 ### B. Spring Data Mongo Repositories
 - `UserRepository extends MongoRepository<AppUser, String>`
@@ -24,20 +25,23 @@
 - `ClaimRepository extends MongoRepository<FoodClaim, String>`
 - `FoodRequestRepository extends MongoRepository<FoodRequest, String>`
 - `DeliveryRepository extends MongoRepository<Delivery, String>`
+- `DeliveryProofRepository extends MongoRepository<DeliveryProof, String>`
 - `TrackingLocationRepository extends MongoRepository<TrackingLocation, String>`
 
-### C. Concurrency & Over-Claim Prevention
-- Replaced SQL pessimistic write locks with **MongoDB atomic conditional updates** (`MongoTemplate.findAndModify`).
-- Atomic meal decrement ensures two concurrent users cannot reserve the same surplus meals.
-- Rejection and cancellation refund reserved portions atomically to the donation document.
-- Verified with multi-threaded concurrency test `ConcurrentClaimAndReservationTests` (10 concurrent threads).
+### C. Concurrency, Conflict & Status State Machine
+- **Automatic Delivery Creation**: When a claim is approved, a delivery record in `PENDING` status is automatically generated in MongoDB.
+- **Conflict Prevention**: Drivers with active deliveries (`ACCEPTED`, `PICKED_UP`, `IN_TRANSIT`) cannot be assigned conflicting deliveries.
+- **Driver Accept/Reject**: Assigned drivers can accept or decline assignments; declines automatically re-queue the delivery to `PENDING`.
+- **Recipient Confirmation**: Direct verification by recipient marks delivery `CONFIRMED` and completes the food claim.
 
 ---
 
-## 3. Frontend & API Integration
-- Cleaned ID parsing in `frontend/src/main.jsx` to support alphanumeric/hex MongoDB ObjectIds seamlessly.
-- Updated Spring Security pattern from `/api/donations/{id:[0-9]+}` to `/api/donations/{id}` to allow public access to MongoDB document IDs.
-- Verified session persistence via `GET /api/me`.
+## 3. Frontend & UI Integration
+- `DriverDashboard.jsx`: Dedicated driver portal with tabs for Pending Acceptance, Active/In-Transit, and Completed Deliveries.
+- `DeliveryDashboard.jsx`: Delivery coordination workspace with admin metrics summary, multi-attribute search, and driver assignment controls.
+- `DeliveryTracking.jsx`: Interactive Leaflet + OpenStreetMap live tracking map with route polyline, driver marker, live GPS broadcasting, and calculated ETA.
+- `DeliveryDetails.jsx`: Comprehensive delivery lifecycle modal with chronological timestamp audit trail and recipient confirmation form.
+- `DeliveryHistory.jsx`: Searchable history and handover audit archive.
 
 ---
 
@@ -46,6 +50,7 @@
 - `DonationWorkflowTests`: **4 / 4 Passed**
 - `ClaimAndDeliveryWorkflowTests`: **2 / 2 Passed**
 - `ConcurrentClaimAndReservationTests`: **1 / 1 Passed**
+- `DeliveryManagementTests`: **5 / 5 Passed** (testing all 14 points of delivery management)
 - `TrackingAndSecurityTests`: **3 / 3 Passed**
-- **Total Backend Tests**: **15 / 15 Passed (100%)**
-- **Frontend Build**: `vite build` completed successfully in 1.57s.
+- **Total Backend Tests**: **20 / 20 Passed (100%)**
+- **Frontend Build**: `vite build` completed successfully in 1.19s with zero errors.
