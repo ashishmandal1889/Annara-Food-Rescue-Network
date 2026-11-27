@@ -1,3 +1,4 @@
+
 package com.annara.security;
 
 import jakarta.servlet.http.HttpServletResponse;
@@ -31,40 +32,97 @@ public class SecurityConfig {
     }
 
     @Bean
-    public SecurityFilterChain filterChain(HttpSecurity http, JwtFilter jwtFilter) throws Exception {
-        return http.csrf(csrf -> csrf.disable())
+    public SecurityFilterChain filterChain(
+            HttpSecurity http,
+            JwtFilter jwtFilter
+    ) throws Exception {
+
+        return http
+                .csrf(csrf -> csrf.disable())
                 .cors(Customizer.withDefaults())
-                .sessionManagement(sm -> sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .sessionManagement(sm ->
+                        sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+                )
                 .authorizeHttpRequests(auth -> auth
-                        .requestMatchers("/api/auth/**", "/api/files/**", "/api/health").permitAll()
-                        .requestMatchers(HttpMethod.GET, "/api/donations", "/api/donations/{id}").permitAll()
-                        .anyRequest().authenticated())
+                        // Public endpoints
+                        .requestMatchers(
+                                "/api/auth/**",
+                                "/api/files/**",
+                                "/api/health"
+                        ).permitAll()
+
+                        // Public donation listing
+                        .requestMatchers(
+                                HttpMethod.GET,
+                                "/api/donations",
+                                "/api/donations/{id}"
+                        ).permitAll()
+
+                        // All other API endpoints require authentication
+                        .requestMatchers("/api/**").authenticated()
+
+                        // Allow frontend pages and static assets
+                        .anyRequest().permitAll()
+                )
                 .exceptionHandling(ex -> ex.authenticationEntryPoint(
                         (request, response, authException) -> {
-                            response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+                            response.setStatus(
+                                    HttpServletResponse.SC_UNAUTHORIZED
+                            );
                             response.setContentType("application/json");
-                            response.getWriter().write("{\"error\":\"Please sign in\"}");
+                            response.getWriter().write(
+                                    "{\"error\":\"Please sign in\"}"
+                            );
                         }
                 ))
                 .httpBasic(basic -> basic.disable())
                 .formLogin(form -> form.disable())
-                .addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class)
+                .addFilterBefore(
+                        jwtFilter,
+                        UsernamePasswordAuthenticationFilter.class
+                )
                 .build();
     }
 
     @Bean
     public CorsConfigurationSource corsConfigurationSource() {
+
         CorsConfiguration c = new CorsConfiguration();
+
         List<String> origins = Arrays.stream(allowedOrigins.split(","))
                 .map(String::trim)
                 .filter(s -> !s.isEmpty())
                 .toList();
-        c.setAllowedOriginPatterns(origins.isEmpty() ? List.of("http://localhost:*", "http://127.0.0.1:*") : origins);
-        c.setAllowedMethods(List.of("GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"));
-        c.setAllowedHeaders(List.of("Authorization", "Content-Type", "Accept", "X-Requested-With"));
+
+        c.setAllowedOriginPatterns(
+                origins.isEmpty()
+                        ? List.of(
+                                "http://localhost:*",
+                                "http://127.0.0.1:*"
+                        )
+                        : origins
+        );
+
+        c.setAllowedMethods(
+                List.of("GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS")
+        );
+
+        c.setAllowedHeaders(
+                List.of(
+                        "Authorization",
+                        "Content-Type",
+                        "Accept",
+                        "X-Requested-With"
+                )
+        );
+
         c.setAllowCredentials(false);
-        UrlBasedCorsConfigurationSource s = new UrlBasedCorsConfigurationSource();
+
+        UrlBasedCorsConfigurationSource s =
+                new UrlBasedCorsConfigurationSource();
+
         s.registerCorsConfiguration("/**", c);
+
         return s;
     }
 }
